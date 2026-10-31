@@ -761,6 +761,7 @@ def main():
 
     if args.relaunch:
         subprocess.run(["osascript", "-e", 'tell application "CapCut" to quit'], check=False)
+        subprocess.run(["killall", "-9", "CapCut"], stderr=subprocess.DEVNULL, check=False)
 
     backup_dir = os.path.join("/tmp", f"capcut_backup_{os.path.basename(proj_dir).replace(' ', '_')}")
     os.makedirs(backup_dir, exist_ok=True)
