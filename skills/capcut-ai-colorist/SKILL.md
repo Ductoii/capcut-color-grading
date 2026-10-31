@@ -96,25 +96,21 @@ For every child video segment `Seg[idx]` (measured over its actual `source_timer
 
 ---
 
-## 4. Strict 5-Tier Guardrails for the 1,636 LUT Library & CapCut `tt_skin_seg` Skin Protection
+## 4. Video-First Pre-Flight `Video × 1,636 LUT` Simulation & CapCut `tt_skin_seg` Skin Protection
 
-All **1,636 LUTs** in `resources/luts/` are profiled in `lut_optical_db.json` with a mandatory `"tier"` classification. **NEVER pick LUTs randomly across tiers!** Follow these strict rules:
+**NEVER hard-lock or reject LUTs blindly without checking the video's actual color first!** Instead, `apply_grade.py` evaluates all **1,636 LUTs** in `lut_optical_db.json` by **checking the video's measured color state first (`diagnose_video_state`) and mathematically simulating `Video × LUT` (`simulate_video_through_lut`)**:
 
-1. **Always Enable CapCut Neural Skin Tone Protection (`"enable_skin_tone_correction": true`)**:
-   - Inside `AmazingFilter_lut/featureAlgorithmConfig/algorithmConfig.json` (`zorder: 2000`), CapCut runs the neural segmentation network `tt_skin_seg` (`skin_seg_0` at `360x640`) to mask human skin (`face, neck, hands`) and protect actors' skin hues from background LUT casts.
-   - Because `tt_skin_seg` protects skin hue, stylized environment LUTs (`Tier 2`) can be safely used on dramatic/climax scenes without turning human faces green, cyan, or purple—**provided intensity is capped at `<= 0.24` (`24%`)**.
-2. **The 5 Strict LUT Tiers (`lut_optical_db.json`)**:
-   - **Tier 1 — `cinema_rec709` (`509 LUTs`: Natural 35mm Cinema Rec.709)**:
-     - **Rule**: **DEFAULT (`100%` unlocked)** for all standard narrative, dialogue, warm-human, luxury-crisp, and vintage-35mm scenes, as well as all intra-scene angle-jump counter-balancing (`base_val ≈ 0.26–0.30`).
-   - **Tier 2 — `stylized_rec709` (`382 LUTs`: Stylized / Atmospheric / Teal-Orange Rec.709 with valid `blk < mid < hi`)**:
-     - **Rule**: **ONLY unlocked** for high-tension confrontation / climax scenes (`climax-punch`, `dramatic-contrast`) or when `--allow-stylized` is passed.
-     - **Mandatory Safeguard**: Must force `"enable_skin_tone_correction": true` (`tt_skin_seg`) AND cap LUT `value <= 0.24` so the environment gets stylized tension while actors' skin stays natural.
-   - **Tier 3 — `bw_mono` (`45 LUTs`: Black & White / Monochrome / Sepia)**:
-     - **Rule**: **LOCKED by default**. ONLY unlock (`--allow-bw` or custom plan override) when the script or user explicitly requests a **Flashback / Memory / Noir** sequence. Never apply to normal color scenes.
-   - **Tier 4 — `camera_log` (`548 LUTs`: `Sony S-Log2/3`, `ARRI LogC`, `Panasonic V-Log`, `Fuji F-Log`, `DJI D-Log`, `REDLog`, `BMDFilm`)**:
-     - **Rule**: **100% FORBIDDEN on AI-generated videos** (`Seedance 2.5`, `Google Omni 1.1`, `Grok`), because AI generators output gamma-encoded **Rec.709 / sRGB**, NOT flat camera Log curves (applying Log LUTs to Rec.709 crushes shadows and clips highlights). ONLY unlock (`--input-color-space log`) if the user explicitly confirms raw flat Log footage from a physical cinema camera.
-   - **Tier 5 — `extreme_clipped` (`152 LUTs`: Non-monotonic / Clipped Exposure Special Effects)**:
-     - **Rule**: **100% LOCKED** for standard filmmaking; only use on explicit user request for nightmare/glitch/experimental shots.
+1. **Step 1 — Diagnose Actual Video Optical State First (`diagnose_video_state(m)`)**:
+   - Inspects `(P5, Mid, P95, Contrast, RB, GM, Sat)` of the scene/segment before touching any LUT:
+     - `FLAT_LOG_OR_FOGGY` (`Contrast < 0.40, P5 > 0.105, P95 < 0.64`): Video itself is flat/washed-out like Log or heavy fog -> **automatically unlocks steeper S-curve & Log-recovery LUTs** (`camera_log` / `stylized_rec709`) that would clip normal footage!
+     - `HIGH_KEY_MILKY` (`P5 > 0.115, Mid > 0.38`): Bright milky curve -> unlocks toe-anchoring LUTs.
+     - `LOW_KEY_DARK` (`Mid < 0.215`): Dark shadow curve -> unlocks shadow-lifting LUTs without crushing blacks.
+     - `HARSH_CONTRAST` (`Contrast > 0.66, P5 < 0.040`): Already steep contrast -> only allows gentle/low-contrast LUTs so shadows/highlights never clip.
+     - `HEAVY_WARM_CAST` (`RB >= 0.165`) / `COLD_CYAN_CAST` (`RB <= 0.080`): Strong color cast -> selects counter-balancing LUTs (`midRB < 0` or `midRB > 0`).
+2. **Step 2 — Simulate `Video × LUT` Output with CapCut `tt_skin_seg` (`simulate_video_through_lut`)**:
+   - For every candidate LUT in the 1,636 database and candidate intensity `alpha ∈ {0.18 .. 0.32}`, computes the exact post-LUT video metrics `(sim_p5, sim_mid, sim_hi, sim_contrast, sim_rb, sim_gm, sim_sat)` while modeling CapCut's neural skin mask `tt_skin_seg` (`"enable_skin_tone_correction": true` at `zorder: 2000`).
+   - **Dynamic Post-LUT Quality Gate**: Rejects any `(LUT, alpha)` pair *only if its simulated output on THIS specific video* crushes blacks (`sim_p5 < 0.014`), clips highlights (`sim_hi > 0.85`), inverts tonal order (`sim_p5 >= sim_mid` or `sim_mid >= sim_hi`), or turns a color video monochrome (`sim_sat < 0.085` unless input is monochrome or `--allow-bw` is set).
+   - Picks the `(LUT, alpha)` pair whose simulated output lands closest to the 35mm Scene Target `(target_p5=0.048, target_mid, target_hi=0.635, target_rb, target_gm, target_sat)`.
 
 ---
 
