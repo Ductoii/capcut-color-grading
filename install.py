@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install capcut-ai-colorist & capcut-draft-tech skills and register core 35mm LUTs in CapCut."""
+"""Install capcut-ai-colorist & capcut-draft-tech skills and register all 1,636 LUTs (Hồ Minh Quân pack) in CapCut."""
 import argparse
 import datetime
 import filecmp
@@ -7,10 +7,13 @@ import json
 import os
 import pathlib
 import shutil
+import tarfile
 import tempfile
+import urllib.request
 
 SKILL_NAMES = ["capcut-ai-colorist", "capcut-draft-tech"]
 LUT_CFG_PATH = pathlib.Path.home() / "Movies/CapCut/User Data/Resources/Lut/LutImportCfg.json"
+FULL_LUT_RELEASE_URL = "https://github.com/Ductoii/capcut-color-grading/releases/download/v1.0.0/luts_full_1636.tar.gz"
 
 
 def same_tree(left: pathlib.Path, right: pathlib.Path) -> bool:
@@ -58,32 +61,74 @@ def install_one_skill(source: pathlib.Path, skills_dir: pathlib.Path, name: str)
     return destination, backup, True
 
 
-def register_bundled_luts(luts_src_dir: pathlib.Path) -> int:
-    if not luts_src_dir.is_dir():
-        return 0
+def register_all_luts(repo_root: pathlib.Path, download_full: bool = True) -> tuple[int, int]:
     lut_dir = LUT_CFG_PATH.parent
     lut_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Copy bundled core LUTs first
+    luts_src_dir = repo_root / "skills" / "capcut-draft-tech" / "resources" / "luts"
+    if luts_src_dir.is_dir():
+        for cube in sorted(luts_src_dir.iterdir()):
+            if cube.suffix.lower() in (".cube", ".3dl"):
+                dst = lut_dir / cube.name
+                if not dst.exists():
+                    shutil.copy2(cube, dst)
+
+    # 2. Check how many LUT files currently exist in CapCut's Lut directory
+    current_files = [
+        p for p in lut_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".cube", ".3dl")
+    ]
+    if download_full and len(current_files) < 1600:
+        local_tar = repo_root / "luts_full_1636.tar.gz"
+        tar_path = str(local_tar) if local_tar.is_file() else ""
+        tmp_tar = None
+        if not tar_path:
+            try:
+                print(f"Downloading full 1,636 LUT pack from {FULL_LUT_RELEASE_URL} ...")
+                fd, tmp_tar = tempfile.mkstemp(suffix=".tar.gz")
+                os.close(fd)
+                req = urllib.request.Request(FULL_LUT_RELEASE_URL, headers={"User-Agent": "capcut-color-grading"})
+                with urllib.request.urlopen(req, timeout=300) as resp, open(tmp_tar, "wb") as out_f:
+                    shutil.copyfileobj(resp, out_f)
+                tar_path = tmp_tar
+            except Exception as exc:
+                print(f"Note: Could not download full LUT release archive ({exc}); using bundled LUTs.")
+        if tar_path and os.path.exists(tar_path):
+            print("Extracting full 1,636 LUT pack into CapCut Resources/Lut ...")
+            with tarfile.open(tar_path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    bname = os.path.basename(member.name)
+                    if bname.lower().endswith((".cube", ".3dl")):
+                        dst_file = lut_dir / bname
+                        if not dst_file.exists():
+                            src_f = tf.extractfile(member)
+                            if src_f:
+                                with open(dst_file, "wb") as out_f:
+                                    shutil.copyfileobj(src_f, out_f)
+        if tmp_tar and os.path.exists(tmp_tar):
+            os.unlink(tmp_tar)
+
+    # 3. Sync LutImportCfg.json with all .cube / .3dl files in lut_dir
     cfg = []
     if LUT_CFG_PATH.is_file():
         try:
             cfg = json.loads(LUT_CFG_PATH.read_text(encoding="utf-8"))
         except Exception:
             cfg = []
-    existing = {it.get("title"): it.get("path") for it in cfg if it.get("path") and os.path.exists(it["path"])}
+    cfg = [it for it in cfg if it.get("path") and os.path.exists(it["path"])]
+    existing_titles = {it.get("title") for it in cfg}
     added = 0
-    for cube in sorted(luts_src_dir.iterdir()):
-        if cube.suffix.lower() not in (".cube", ".3dl"):
-            continue
-        if cube.name not in existing:
-            dst = lut_dir / cube.name
-            if not dst.exists():
-                shutil.copy2(cube, dst)
-            cfg = [it for it in cfg if it.get("title") != cube.name]
-            cfg.append({"path": str(dst), "title": cube.name})
-            added += 1
-    if added > 0 or not LUT_CFG_PATH.is_file():
-        LUT_CFG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return added
+    for cube in sorted(lut_dir.iterdir(), key=lambda x: x.name.lower()):
+        if cube.is_file() and cube.suffix.lower() in (".cube", ".3dl"):
+            if cube.name not in existing_titles:
+                cfg.append({"path": str(cube), "title": cube.name})
+                existing_titles.add(cube.name)
+                added += 1
+    LUT_CFG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return len(cfg), added
 
 
 def main():
@@ -94,6 +139,11 @@ def main():
         default=pathlib.Path.home() / ".agents" / "skills",
         help="Skills parent directory; defaults to ~/.agents/skills",
     )
+    parser.add_argument(
+        "--no-download-luts",
+        action="store_true",
+        help="Skip downloading the full 1,636 LUT release pack if not already present locally.",
+    )
     args = parser.parse_args()
     repo_root = pathlib.Path(__file__).resolve().parent
     for name in SKILL_NAMES:
@@ -103,8 +153,8 @@ def main():
         if backup:
             print("  Previous version backed up: " + str(backup))
 
-    added_luts = register_bundled_luts(repo_root / "skills" / "capcut-draft-tech" / "resources" / "luts")
-    print(f"Core 35mm LUTs verified in CapCut ({added_luts} newly registered).")
+    total_luts, added_luts = register_all_luts(repo_root, download_full=not args.no_download_luts)
+    print(f"CapCut LUT library ready: {total_luts} total LUTs registered ({added_luts} newly added).")
     print("Invoke $capcut-ai-colorist in Codex / Antigravity.")
 
 
