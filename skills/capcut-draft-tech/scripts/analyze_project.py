@@ -155,29 +155,47 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
         try:
             lines = open(cfile, "r", encoding="utf-8", errors="ignore").readlines()
             clip_map = {}
-            current_header = "SCENE"
+            era_idx = 0
+            era_label = "E0"
             for line in lines:
                 line_s = line.strip()
                 if line_s.startswith("----") and line_s.endswith("----"):
-                    hdr = line_s.strip("- ").split("(")[0].strip()
-                    current_header = hdr
+                    era_idx += 1
+                    era_label = f"E{era_idx}"
+                    continue
+                if "THẺ CHỮ" in line_s or "THE CHU" in line_s.upper():
+                    era_idx += 1
+                    m_tc = re.search(r"THẺ CHỮ\s*:\s*([^|]+)", line_s, re.IGNORECASE)
+                    tc_short = re.sub(r"[^A-Z0-9]+", "_", m_tc.group(1).strip().upper())[:14].strip("_") if m_tc else f"E{era_idx}"
+                    era_label = f"E{era_idx}_{tc_short}"
                     continue
                 # Match table row: "001 | 30 | 9 | BG1a, CHAR1a..."
                 m_row = re.match(r"^(\d{1,3})\s*\|\s*\d+\s*\|\s*\d+\s*\|\s*([^|]+)\|", line_s)
                 if m_row:
                     cnum = int(m_row.group(1))
                     refs_str = m_row.group(2)
-                    m_bg = re.search(r"(BG\d+)[a-z]?", refs_str)
-                    clip_map[cnum] = m_bg.group(1) if m_bg else ""
+                    m_bg = re.search(r"(BG\d+)([a-z])?", refs_str)
+                    if m_bg:
+                        base_b, suf_b = m_bg.group(1), (m_bg.group(2) or "").lower()
+                        bg_norm = f"{base_b}C" if suf_b == "c" else base_b
+                        clip_map[cnum] = f"{era_label}:{bg_norm}"
+                    else:
+                        clip_map[cnum] = ""
                     continue
                 # Match prompt line: "Scene 001: ... BG1a ..."
                 m_pr = re.match(r"^Scene\s+(\d{1,3})\s*:(.*)$", line_s, re.IGNORECASE)
                 if m_pr:
                     cnum = int(m_pr.group(1))
                     body = m_pr.group(2)
-                    m_bg = re.search(r"(BG\d+)[a-z]?", body)
+                    if "THẺ CHỮ" in body or "title card" in body.lower():
+                        era_idx += 1
+                        era_label = f"E{era_idx}"
+                        continue
+                    m_bg = re.search(r"(BG\d+)([a-z])?", body)
                     if m_bg:
-                        clip_map[cnum] = m_bg.group(1)
+                        base_b, suf_b = m_bg.group(1), (m_bg.group(2) or "").lower()
+                        bg_norm = f"{base_b}C" if suf_b == "c" else base_b
+                        clip_map[cnum] = f"{era_label}:{bg_norm}"
             if len(clip_map) >= 10:
                 return clip_map, cfile
         except Exception:
@@ -207,14 +225,18 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None) -> list
     if clip_bg_map:
         # Assign each segment its ground-truth base BG code
         raw_bgs = []
-        for r in seg_records:
-            cnum = extract_clip_number(r["material_name"])
+        for idx_r, r in enumerate(seg_records):
+            mname = r["material_name"]
+            if idx_r == 0 and (mname.startswith("ord_") or r.get("dur_sec", 0) >= 20.0):
+                raw_bgs.append("SEEDANCE_HOOK:BG1")
+                continue
+            cnum = extract_clip_number(mname)
             raw_bgs.append(clip_bg_map.get(cnum, ""))
 
         # Fill empty/transition clips from nearest known BG
         for i in range(n):
             if not raw_bgs[i]:
-                prev_bg = next((raw_bgs[j] for j in range(i - 1, -1, -1) if raw_bgs[j]), "")
+                prev_bg = next((raw_bgs[j] for j in range(i - 1, -1, -1) if raw_bgs[j] and not raw_bgs[j].startswith("SEEDANCE_HOOK")), "")
                 next_bg = next((raw_bgs[j] for j in range(i + 1, n) if raw_bgs[j]), "")
                 raw_bgs[i] = prev_bg or next_bg or "BG_DEFAULT"
 
@@ -277,36 +299,41 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None) -> list
 
 def collect_all_video_segments(root_draft: dict) -> list[tuple[dict, dict, dict, str]]:
     """
-    Collect EVERY child video segment (`video con`) across all Compound Clips (`materials.drafts`)
-    AND any direct video segments on the root timeline (`root_draft.tracks`), in chronological order.
+    Collect EVERY child video segment (`video con`) across all Compound Clips (`materials.drafts`,
+    including multi-level nested Compound Clips) AND any direct video segments on the root timeline
+    (`root_draft.tracks`), sorted in exact chronological timeline order.
     Returns list of tuples: (draft_obj, seg_obj, video_material_obj, container_label).
     """
-    collected = []
+    timed_items = []
     visited_drafts = set()
+    root_nested = {nd["id"]: nd for nd in root_draft.get("materials", {}).get("drafts", []) if isinstance(nd, dict) and "draft" in nd}
 
-    def _scan_draft(d_obj: dict, label: str):
+    def _scan_draft(d_obj: dict, label: str, offset_us: int = 0):
         vids = {v["id"]: v for v in d_obj.get("materials", {}).get("videos", [])}
-        nested_drafts = {nd["id"]: nd for nd in d_obj.get("materials", {}).get("drafts", []) if "draft" in nd}
+        local_nested = {nd["id"]: nd for nd in d_obj.get("materials", {}).get("drafts", []) if isinstance(nd, dict) and "draft" in nd}
+        nested_drafts = {**root_nested, **local_nested}
         for trk_idx, trk in enumerate(d_obj.get("tracks", [])):
             if trk.get("type", "video") != "video":
                 continue
             for seg in trk.get("segments", []):
+                seg_start_us = offset_us + int(seg.get("target_timerange", {}).get("start", 0))
                 mid = seg.get("material_id", "")
                 refs = [mid] + list(seg.get("extra_material_refs", []))
                 matched_nd_id = next((r for r in refs if r in nested_drafts), None)
                 if matched_nd_id:
                     visited_drafts.add(matched_nd_id)
                     nd = nested_drafts[matched_nd_id]
-                    _scan_draft(nd["draft"], f"{label}/Compound[{nd.get('name') or matched_nd_id[:6]}]")
+                    _scan_draft(nd["draft"], f"{label}/Compound[{nd.get('name') or matched_nd_id[:6]}]", seg_start_us)
                 elif mid in vids and vids[mid].get("path"):
-                    collected.append((d_obj, seg, vids[mid], f"{label}:T{trk_idx}"))
+                    timed_items.append((seg_start_us, trk_idx, d_obj, seg, vids[mid], f"{label}:T{trk_idx}"))
 
-    _scan_draft(root_draft, "Root")
+    _scan_draft(root_draft, "Root", 0)
     for i, sd in enumerate(root_draft.get("materials", {}).get("drafts", [])):
         if "draft" in sd and sd.get("id") not in visited_drafts:
-            _scan_draft(sd["draft"], f"Compound[{i}]")
+            _scan_draft(sd["draft"], f"Compound[{i}]", 0)
 
-    return collected
+    timed_items.sort(key=lambda x: (x[0], x[1]))
+    return [(x[2], x[3], x[4], x[5]) for x in timed_items]
 
 
 def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180) -> np.ndarray:
@@ -320,7 +347,15 @@ def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180
     return np.zeros((h, w, 3), dtype=np.float32)
 
 
-def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clusters: list, out_jpg: str):
+def resolve_video_path(vpath: str, proj_dir: str) -> str:
+    if not vpath:
+        return ""
+    if vpath.startswith("##_draftpath_placeholder_"):
+        vpath = re.sub(r"^##_draftpath_placeholder_[^#]+_##", proj_dir, vpath)
+    return vpath
+
+
+def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clusters: list, out_jpg: str, proj_dir: str = ""):
     from PIL import Image, ImageDraw
     w, h, pad_top = 320, 180, 26
     cols = 4
@@ -333,13 +368,14 @@ def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clus
         _, _, v, _ = all_seg_tuples[mid_seg]
         rec = seg_records[mid_seg]
         ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
-        rgb = extract_rgb_frame(v.get("path", ""), ts, w, h)
+        vp = resolve_video_path(v.get("path", ""), proj_dir)
+        rgb = extract_rgb_frame(vp, ts, w, h)
         tile = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8))
         r_i, c_i = divmod(idx, cols)
         x0, y0 = c_i * w, r_i * (h + pad_top)
         sheet.paste(tile, (x0, y0 + pad_top))
         a = c["anchor"]
-        lbl = f"S{c['cluster_id']:02d} ({c['bg_code']}) Seg {c['start_seg']}..{c['end_seg']} | Mid:{a['mid']:.2f} RB:{a['rb']:+.2f}"
+        lbl = f"S{c['cluster_id']:02d} ({c['bg_code'][:12]}) Seg {c['start_seg']}..{c['end_seg']} | Mid:{a['mid']:.2f} RB:{a['rb']:+.2f}"
         draw.text((x0 + 6, y0 + 6), lbl, fill=(240, 220, 140))
 
     sheet.save(out_jpg, quality=88)
@@ -366,7 +402,7 @@ def main():
         root_draft = json.load(f)
 
     all_seg_tuples = collect_all_video_segments(root_draft)
-    video_paths = list({v.get("path", "") for _, _, v, _ in all_seg_tuples if v.get("path")})
+    video_paths = list({resolve_video_path(v.get("path", ""), proj_dir) for _, _, v, _ in all_seg_tuples if v.get("path")})
     clip_bg_map, gt_path = discover_ground_truth_scene_map(video_paths)
     if gt_path:
         print(f"Found Ground-Truth Scene Map: {gt_path} ({len(clip_bg_map)} clips mapped to BG locations)")
@@ -374,17 +410,32 @@ def main():
         print("WARNING: No *BANGTRA*.txt / sf-board.json found in video folders — using Visual Fallback clustering (confirm with user!).")
 
     print(f"Project '{os.path.basename(proj_dir)}': Measuring {len(all_seg_tuples)} child video segments (video con) at exact source_timerange...")
-    seg_records = []
+    from concurrent.futures import ThreadPoolExecutor
+    unique_jobs = {}
+    for _, seg, v, _ in all_seg_tuples:
+        vpath = resolve_video_path(v.get("path", ""), proj_dir)
+        st_sec = seg.get("source_timerange", {}).get("start", 0) / 1e6
+        dur_sec = seg.get("source_timerange", {}).get("duration", 5000000) / 1e6
+        ck = (vpath, round(st_sec, 1), round(dur_sec, 1))
+        if ck not in unique_jobs and os.path.exists(vpath):
+            unique_jobs[ck] = (vpath, st_sec, dur_sec)
+
     cache_by_range = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {ck: pool.submit(extract_segment_metrics, vp, st, dur) for ck, (vp, st, dur) in unique_jobs.items()}
+        for ck, fut in futs.items():
+            cache_by_range[ck] = fut.result()
+
+    seg_records = []
     for idx, (_, seg, v, container_lbl) in enumerate(all_seg_tuples):
-        vpath = v.get("path", "")
+        vpath = resolve_video_path(v.get("path", ""), proj_dir)
         mname = v.get("material_name") or os.path.basename(vpath)
         st_sec = seg.get("source_timerange", {}).get("start", 0) / 1e6
         dur_sec = seg.get("source_timerange", {}).get("duration", 5000000) / 1e6
         cache_key = (vpath, round(st_sec, 1), round(dur_sec, 1))
-        if cache_key not in cache_by_range and os.path.exists(vpath):
-            cache_by_range[cache_key] = extract_segment_metrics(vpath, st_sec, dur_sec)
         m = cache_by_range.get(cache_key, {})
+        sc_obj = seg.get("clip", {}).get("scale", {}) if isinstance(seg.get("clip"), dict) else {}
+        seg_scale = max(float(sc_obj.get("x", 1.0)), float(sc_obj.get("y", 1.0)))
         seg_records.append({
             "seg_idx": idx,
             "seg_id": seg.get("id", ""),
@@ -392,6 +443,7 @@ def main():
             "material_name": mname,
             "start_sec": round(st_sec, 2),
             "dur_sec": round(dur_sec, 2),
+            "scale": round(seg_scale, 3),
             "metrics": m,
         })
 
@@ -431,7 +483,7 @@ def main():
 
     preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
     try:
-        render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg)
+        render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir)
         print(f"\n[MANDATORY AI VISUAL CHECK] Rendered raw scene contact sheet: {preview_jpg}")
         print("-> AI MUST call read_file / view_file on this image to visually inspect the raw scene colors & lighting before grading!")
     except Exception as exc:
