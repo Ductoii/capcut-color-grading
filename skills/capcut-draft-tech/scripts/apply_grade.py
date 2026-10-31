@@ -739,6 +739,194 @@ def render_graded_comparison_sheet(
     sheet.save(out_jpg, quality=90)
 
 
+MINI_DRAFT_ADJUST_SLOT_MAP = {
+    "lut": "lut",
+    "brightness": "brightness",
+    "contrast": "contrast",
+    "saturation": "saturation",
+    "sharpen": "sharpening",
+    "highlight": "highlight",
+    "shadow": "shadow",
+    "clear": "clear",
+    "temperature": "color_temperature",
+    "tone": "hue",
+    "light_sensation": "light_sensation",
+    "particle": "particle",
+    "vignetting": "vignetting",
+    "fade": "fade",
+}
+
+
+def make_mini_draft_effect(eff: dict) -> dict:
+    return {
+        "adjust_params": None,
+        "algorithm_artifact_path": eff.get("algorithm_artifact_path", ""),
+        "beauty_body_auto_preset_id": eff.get("beauty_body_auto_preset_id", ""),
+        "beauty_face_auto_preset_id": eff.get("beauty_face_auto_preset_id", ""),
+        "beauty_face_auto_retouch_info": {
+            "beauty_face_auto_retouch_id": "",
+            "face_id": [],
+            "id": str(uuid.uuid4()).upper(),
+        },
+        "bloom_params": eff.get("bloom_params", None),
+        "category_id": eff.get("category_id", ""),
+        "category_key": eff.get("category_key", ""),
+        "category_name": eff.get("category_name", ""),
+        "color_match_info": {
+            "id": str(uuid.uuid4()).upper(),
+            "source_feature_path": "",
+            "target_feature_path": "",
+            "target_image_path": "",
+        },
+        "covering_relation_change": eff.get("covering_relation_change", 0),
+        "effect_id": eff.get("effect_id", "7501974767453474064"),
+        "enable_skin_tone_correction": bool(eff.get("enable_skin_tone_correction", False)),
+        "exclusion_group": eff.get("exclusion_group", []),
+        "face_adjust_params": None,
+        "formula_id": eff.get("formula_id", ""),
+        "id": eff["id"],
+        "intensity_key": eff.get("intensity_key", ""),
+        "is_from_intelligent_quality": bool(eff.get("is_from_intelligent_quality", False)),
+        "item_effect_type": eff.get("item_effect_type", 0),
+        "lumi_hub_path": eff.get("lumi_hub_path", ""),
+        "name": eff.get("name", ""),
+        "panel_id": eff.get("panel_id", ""),
+        "path": eff.get("path", ""),
+        "platform": eff.get("platform", "all"),
+        "report_name": eff.get("report_name", ""),
+        "request_id": eff.get("request_id", ""),
+        "resource_id": eff.get("resource_id", "7501974767453474064"),
+        "smart_color_mode": eff.get("smart_color_mode", 0),
+        "smart_color_mode_cache": [],
+        "source_platform": eff.get("source_platform", 1),
+        "sub_category_id": eff.get("sub_category_id", ""),
+        "sub_category_name": eff.get("sub_category_name", ""),
+        "sub_type": 0,
+        "third_resource_id": eff.get("third_resource_id", ""),
+        "time_range": eff.get("time_range", None),
+        "transparent_params": "",
+        "type": eff["type"],
+        "value": eff["value"],
+        "version": eff.get("version", ""),
+        "visible": bool(eff.get("visible", True)),
+    }
+
+
+def build_mini_draft_adjust(seg: dict, effects_by_id: dict, existing_adjust: dict = None) -> dict:
+    base = {
+        "adjust_mask": None,
+        "adjust_preset_resource_id": "",
+        "backlight_correction": None,
+        "black": None,
+        "brightness": None,
+        "clear": None,
+        "color_adjust_pro": None,
+        "color_correct": None,
+        "color_correct_alg_result": "",
+        "color_curves": None,
+        "color_dehaze": None,
+        "color_levels": None,
+        "color_match": None,
+        "color_soften": None,
+        "color_temperature": None,
+        "contrast": None,
+        "enable_adjust": bool(seg.get("enable_adjust", False)),
+        "enable_adjust_mask": False,
+        "enable_color_adjust_pro": False,
+        "enable_color_correct_adjust": False,
+        "enable_color_curves": True,
+        "enable_color_match_adjust": False,
+        "enable_color_wheels": True,
+        "enable_hsl": bool(seg.get("enable_hsl", False)),
+        "enable_hsl_curves": True,
+        "enable_lut": bool(seg.get("enable_lut", False)),
+        "enable_smart_color_adjust": False,
+        "fade": None,
+        "filter": None,
+        "highlight": None,
+        "hsl": existing_adjust.get("hsl") if isinstance(existing_adjust, dict) else None,
+        "hsl_curves": existing_adjust.get("hsl_curves") if isinstance(existing_adjust, dict) else None,
+        "hue": None,
+        "id": existing_adjust.get("id") if (isinstance(existing_adjust, dict) and existing_adjust.get("id")) else str(uuid.uuid4()).upper(),
+        "light_sensation": None,
+        "log_color_wheels": existing_adjust.get("log_color_wheels") if isinstance(existing_adjust, dict) else None,
+        "lut": None,
+        "naturalSaturation": None,
+        "particle": None,
+        "primary_color_wheels": existing_adjust.get("primary_color_wheels") if isinstance(existing_adjust, dict) else None,
+        "restore_detail": None,
+        "saturation": None,
+        "shadow": None,
+        "sharpening": None,
+        "skin_tone_correction": None,
+        "smart_adjust_color": None,
+        "type": "adjust",
+        "vignetting": None,
+        "white": None,
+    }
+    for ref_id in seg.get("extra_material_refs", []):
+        eff = effects_by_id.get(ref_id)
+        if not eff:
+            continue
+        slot = MINI_DRAFT_ADJUST_SLOT_MAP.get(eff.get("type", ""))
+        if slot:
+            base[slot] = make_mini_draft_effect(eff)
+    return base
+
+
+def sync_mini_draft_files(proj_dir: str, draft_containers: list, backup_dir: str):
+    """
+    Synchronizes CapCut 5+ `Timelines/*/attachment/patch/mini_draft.json` and resets `patch.json`
+    so that both Root Timeline segments (`mini_draft_data.segments`) and Compound Clip child segments
+    (`mini_draft_data.material_drafts[].segments`) immediately reflect the new LUT + 12-slider Adjust grade!
+    """
+    import time
+    seg_info_map = {}
+    for d_obj in draft_containers:
+        eff_by_id = {e["id"]: e for e in d_obj.get("materials", {}).get("effects", []) if "id" in e}
+        for trk in d_obj.get("tracks", []):
+            if trk.get("type") == "video":
+                for seg in trk.get("segments", []):
+                    sid = seg.get("id")
+                    if sid:
+                        seg_info_map[sid] = (seg, eff_by_id)
+
+    for tl_dir in glob.glob(os.path.join(proj_dir, "Timelines", "*")):
+        if not os.path.isdir(tl_dir):
+            continue
+        patch_dir = os.path.join(tl_dir, "attachment", "patch")
+        mini_path = os.path.join(patch_dir, "mini_draft.json")
+        patch_path = os.path.join(patch_dir, "patch.json")
+        if os.path.exists(mini_path):
+            shutil.copy2(mini_path, os.path.join(backup_dir, f"mini_draft_{os.path.basename(tl_dir)}.json"))
+            try:
+                with open(mini_path, "r", encoding="utf-8") as mf:
+                    md_obj = json.load(mf)
+                mdd = md_obj.get("mini_draft_data", {})
+                now_s = int(time.time())
+                if isinstance(mdd.get("header"), dict):
+                    mdd["header"]["timestamp"] = now_s
+                    mdd["header"]["timestamp_ms"] = now_s * 1000
+                for s in mdd.get("segments", []) or []:
+                    sid = s.get("id")
+                    if sid in seg_info_map and s.get("type") == "segment_video":
+                        seg_d, eff_map = seg_info_map[sid]
+                        s["adjust"] = build_mini_draft_adjust(seg_d, eff_map, s.get("adjust"))
+                for md_entry in mdd.get("material_drafts", []) or []:
+                    for s in md_entry.get("segments", []) or []:
+                        sid = s.get("id")
+                        if sid in seg_info_map and s.get("type") == "segment_video":
+                            seg_d, eff_map = seg_info_map[sid]
+                            s["adjust"] = build_mini_draft_adjust(seg_d, eff_map, s.get("adjust"))
+                with open(mini_path, "w", encoding="utf-8") as mf:
+                    json.dump(md_obj, mf, ensure_ascii=False, separators=(",", ":"))
+            except Exception as exc:
+                print(f"Warning: could not sync mini_draft.json ({exc})")
+        if os.path.exists(patch_path):
+            with open(patch_path, "w", encoding="utf-8") as pf:
+                pf.write('{"patch_data":[]}\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Apply scene-continuous & per-child-video 35mm grading to a CapCut project.")
     parser.add_argument("project", help="CapCut Project ID or path.")
@@ -762,8 +950,11 @@ def main():
     lut_map = load_lut_map()
 
     if args.relaunch:
-        subprocess.run(["osascript", "-e", 'tell application "CapCut" to quit'], check=False)
+        import time
+        subprocess.run(["killall", "-TERM", "CapCut"], stderr=subprocess.DEVNULL, check=False)
+        time.sleep(0.8)
         subprocess.run(["killall", "-9", "CapCut"], stderr=subprocess.DEVNULL, check=False)
+        time.sleep(0.5)
 
     backup_dir = os.path.join("/tmp", f"capcut_backup_{os.path.basename(proj_dir).replace(' ', '_')}")
     os.makedirs(backup_dir, exist_ok=True)
@@ -780,14 +971,20 @@ def main():
 
     # Load or compute per-segment source_timerange diagnostics + ground-truth BG map
     seg_records = []
+    preloaded_cache = {}
     video_paths = list({resolve_video_path(v.get("path", ""), proj_dir) for _, _, v, _ in all_seg_tuples if v.get("path")})
     clip_bg_map, _ = discover_ground_truth_scene_map(video_paths)
     if args.metrics and os.path.exists(args.metrics):
         loaded = json.load(open(args.metrics, "r", encoding="utf-8"))
-        if isinstance(loaded, dict) and "segments" in loaded and len(loaded["segments"]) == len(all_seg_tuples):
-            seg_records = loaded["segments"]
+        if isinstance(loaded, dict):
             if not clip_bg_map:
                 clip_bg_map = {int(k): v for k, v in loaded.get("clip_bg_map", {}).items()}
+            for r in loaded.get("segments", []):
+                if r.get("metrics"):
+                    preloaded_cache[(r.get("material_name", ""), round(float(r.get("start_sec", 0)), 1), round(float(r.get("dur_sec", 0)), 1))] = r["metrics"]
+                    preloaded_cache[(r.get("material_name", ""), -1.0, -1.0)] = r["metrics"]
+            if len(loaded.get("segments", [])) == len(all_seg_tuples):
+                seg_records = loaded["segments"]
 
     if not seg_records or len(seg_records) != len(all_seg_tuples):
         cache_by_range = {}
@@ -798,7 +995,13 @@ def main():
             st_sec = seg.get("source_timerange", {}).get("start", 0) / 1e6
             dur_sec = seg.get("source_timerange", {}).get("duration", 5000000) / 1e6
             ck = (vpath, round(st_sec, 1), round(dur_sec, 1))
-            if ck not in cache_by_range and os.path.exists(vpath):
+            pk1 = (mname, round(st_sec, 1), round(dur_sec, 1))
+            pk2 = (mname, -1.0, -1.0)
+            if pk1 in preloaded_cache:
+                cache_by_range[ck] = preloaded_cache[pk1]
+            elif pk2 in preloaded_cache:
+                cache_by_range[ck] = preloaded_cache[pk2]
+            elif ck not in cache_by_range and os.path.exists(vpath):
                 cache_by_range[ck] = extract_segment_metrics(vpath, st_sec, dur_sec)
             sc_obj = seg.get("clip", {}).get("scale", {}) if isinstance(seg.get("clip"), dict) else {}
             seg_scale = max(float(sc_obj.get("x", 1.0)), float(sc_obj.get("y", 1.0)))
@@ -827,17 +1030,19 @@ def main():
         old_eff_ids.update(e["id"] for e in effs if e.get("type") in managed_types)
         effs[:] = [e for e in effs if e.get("type") not in managed_types]
 
-    # Clear any old effects on outer Compound Clip wrapper segments on root_draft
-    # (NEVER double-stack a second LUT/Sharpen/Clear on the wrapper when child videos are individually graded!)
-    if has_compound:
-        compound_ids = {sd["id"] for sd in sub_drafts if "id" in sd}
-        for trk in root_draft.get("tracks", []):
-            for seg in trk.get("segments", []):
-                seg_refs = [seg.get("material_id", "")] + list(seg.get("extra_material_refs", []))
-                if any(r in compound_ids for r in seg_refs):
-                    seg["extra_material_refs"] = [r for r in seg.get("extra_material_refs", []) if r not in old_eff_ids]
-                    seg["enable_lut"] = False
-                    seg["enable_adjust"] = False
+    # Clear any old effects on Compound Clip wrapper segments or photo/logo overlays across all draft containers
+    # (NEVER double-stack a second LUT/Sharpen/Clear on a wrapper or watermark photo!)
+    compound_ids = {sd["id"] for sd in sub_drafts if "id" in sd}
+    for d_obj in draft_containers:
+        photo_ids = {v["id"] for v in d_obj.get("materials", {}).get("videos", []) if v.get("type") == "photo" and "id" in v}
+        for trk in d_obj.get("tracks", []):
+            if trk.get("type") == "video":
+                for seg in trk.get("segments", []):
+                    seg_refs = [seg.get("material_id", "")] + list(seg.get("extra_material_refs", []))
+                    if any(r in compound_ids for r in seg_refs) or seg.get("material_id", "") in photo_ids:
+                        seg["extra_material_refs"] = [r for r in seg.get("extra_material_refs", []) if r not in old_eff_ids]
+                        seg["enable_lut"] = False
+                        seg["enable_adjust"] = False
 
     # 2. Ground-Truth Scene Clustering + Unified Location Targets + Seedance Dark-Scene Sync
     optical_db = load_optical_db(lut_map)
@@ -906,7 +1111,7 @@ def main():
         seg["enable_adjust"] = True
         summary.append((idx, c_info["cluster_id"], mname, lut_title, val, prof, len(adj_list)))
 
-    # 3. Write synced files (Root + Timelines + ALL Subdraft Compound Clips)
+    # 3. Write synced files (Root + Timelines + mini_draft.json + ALL Subdraft Compound Clips)
     root_json_str = json.dumps(root_draft, ensure_ascii=False, separators=(",", ":"))
     sync_targets = ["draft_info.json", "draft_info.json.bak", "template-2.tmp"]
     for tl_dir in glob.glob(os.path.join(proj_dir, "Timelines", "*")):
@@ -914,16 +1119,14 @@ def main():
             for fname in ("draft_info.json", "draft_info.json.bak", "template-2.tmp"):
                 rel = os.path.relpath(os.path.join(tl_dir, fname), proj_dir)
                 sync_targets.append(rel)
-            patch_file = os.path.join(tl_dir, "attachment", "patch", "patch.json")
-            if os.path.exists(patch_file):
-                with open(patch_file, "w", encoding="utf-8") as pf:
-                    pf.write('{"patch_data":[]}\n')
 
     for rel in sync_targets:
         full_p = os.path.join(proj_dir, rel)
         if os.path.exists(os.path.dirname(full_p)):
             with open(full_p, "w", encoding="utf-8") as f:
                 f.write(root_json_str)
+
+    sync_mini_draft_files(proj_dir, draft_containers, backup_dir)
 
     if has_compound:
         draft_by_id = {sd["id"]: sd["draft"] for sd in sub_drafts if "id" in sd and "draft" in sd}
