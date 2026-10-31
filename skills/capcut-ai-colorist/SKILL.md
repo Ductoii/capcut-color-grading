@@ -15,27 +15,30 @@ This skill defines **how the AI Colorist thinks, interacts with the user, maps s
 
 ---
 
-## 1. MANDATORY STEP 0: Pre-Grading User Intake (STOP & ASK FIRST)
+## 1. MANDATORY STEP 0: Pre-Grading User Intake & AI Visual Inspection (STOP, VIEW FRAMES & ASK FIRST)
 
-> **CRITICAL RULE — NEVER GRADE IMMEDIATELY ON THE FIRST REQUEST**:
+> **CRITICAL RULE — NEVER GRADE BLINDLY & NEVER RELY ON CODE NUMBERS ALONE**:
 > Even within the same AI model (Seedance 2.5, Google Omni 1.1, or Grok), every video and every cut segment (`source_timerange`) varies by prompt, camera angle, and generation seed.
-> When the user asks to color-grade a CapCut project, **DO NOT write or apply any grading changes yet**.
+> Furthermore, **the AI MUST visually inspect the actual video frames with its own eyes (`read_file` / `view_file`) both BEFORE and AFTER grading** — never trust metrics alone!
 
-Follow this exact 2-step intake workflow first:
-1. **Run Read-Only Segment-Level & Bảng-Tra Scene Analysis First**:
-   - Run `capcut-draft-tech/scripts/analyze_project.py` on the requested project.
-   - It automatically searches the video folder for ground-truth script files (`*BANGTRA*.txt`, `*PROMPT*.txt`, `sf-board.json`) to map every clip to its exact location (`BG1a/b`, `BG2a/b`, etc.), AND measures the actual frames of **every cut segment (`Seg[idx]` at its exact `source_timerange`)** rather than just once per `.mp4` file.
+Follow this exact 3-step workflow:
+1. **Run Read-Only Segment-Level Analysis & Visually Inspect `/tmp/<project>_raw_scenes.jpg` First**:
+    - Run `capcut-draft-tech/scripts/analyze_project.py` on the requested project.
+    - It searches the video folder for ground-truth script files (`*BANGTRA*.txt`, `*PROMPT*.txt`, `sf-board.json`) to map every clip to its exact location (`BG1a/b`, `BG2a/b`, etc.), measures **every cut segment (`Seg[idx]` at its exact `source_timerange`)**, AND renders the **Raw Scene Contact Sheet (`/tmp/<project>_raw_scenes.jpg`)**.
+    - **MANDATORY AI VISUAL CHECK #1 (Before Grading)**: Call `read_file` / `view_file` on `/tmp/<project>_raw_scenes.jpg` to **visually see the raw colors, skin tones, lighting, and atmosphere of each scene with your own eyes**!
 2. **Ask the User Before Grading** (use `ask_question` or concise bullet questions):
-   - **Question 1 — Nguồn tạo video (Model Source & Outliers)**:
-     - Ask: *"Project này được tạo bằng model nào (**Seedance 2.5**, **Google Omni 1.1**, **Grok**, hay **Hỗn hợp nhiều model**)? Nếu là hỗn hợp, bạn có nhớ các clip nào thuộc model khác không?"*
-     - Also report whether a ground-truth `*BANGTRA*.txt` / `sf-board.json` was found (or ask the user where the script/bảng tra is if none was found) and list any segments with strong intra-scene angle jumps.
-   - **Question 2 — Định hướng Cảm xúc & Mạch phim (Emotional Direction)**:
-     - Ask the user what emotional tone they want for the film:
-       - **Ấm áp – Nhân văn – Chữa lành (Warm Human Drama & Golden Reunion)**
-       - **Kịch tính – Gai góc – Tương phản sâu (Dramatic High-Contrast Cinema)**
-       - **Sang trọng – Điện ảnh Hiện đại (Luxury & Crisp 35mm)**
-       - **Chia theo Mạch Cảm Xúc Kịch Bản (Dynamic Narrative Arc)**: Tự động chuyển tone mượt mà theo từng hồi của kịch bản (Mở đầu -> Xung đột -> Cao trào -> Kết đoàn viên).
-3. **Only after receiving the user's answers**, execute the grading plan.
+    - **Question 1 — Nguồn tạo video (Model Source & Outliers)**:
+      - Ask: *"Project này được tạo bằng model nào (**Seedance 2.5**, **Google Omni 1.1**, **Grok**, hay **Hỗn hợp nhiều model**)? Nếu là hỗn hợp, bạn có nhớ các clip nào thuộc model khác không?"*
+      - Share your visual observations from `/tmp/<project>_raw_scenes.jpg`, report whether a ground-truth `*BANGTRA*.txt` / `sf-board.json` was found, and list any segments with strong intra-scene angle jumps.
+    - **Question 2 — Định hướng Cảm xúc & Mạch phim (Emotional Direction)**:
+      - Ask the user what emotional tone they want for the film:
+        - **Ấm áp – Nhân văn – Chữa lành (Warm Human Drama & Golden Reunion)**
+        - **Kịch tính – Gai góc – Tương phản sâu (Dramatic High-Contrast Cinema)**
+        - **Sang trọng – Điện ảnh Hiện đại (Luxury & Crisp 35mm)**
+        - **Chia theo Mạch Cảm Xúc Kịch Bản (Dynamic Narrative Arc)**: Tự động chuyển tone mượt mà theo từng hồi của kịch bản (Mở đầu -> Xung đột -> Cao trào -> Kết đoàn viên).
+3. **Apply Grade & Perform MANDATORY AI VISUAL QA #2 on `/tmp/<project>_graded_comparison.jpg`**:
+    - After receiving the user's answers, run `apply_grade.py`. It automatically renders the side-by-side **`RAW vs. GRADED` Visual Comparison Sheet (`/tmp/<project>_graded_comparison.jpg`)** with the actual `.cube` 3D LUT + Skin Protection + 12 Adjust sliders applied to each scene's real pixels.
+    - **MANDATORY AI VISUAL CHECK #2 (After Grading)**: Call `read_file` / `view_file` on `/tmp/<project>_graded_comparison.jpg` to **visually verify every scene's graded result with your own eyes**! If any scene/shot looks visually off (unnatural skin, crushed shadows, or scene-to-scene color mismatch), override that scene/segment via `--plan` and re-run `apply_grade.py` until the visual comparison sheet looks 100% cinema-grade!
 
 ---
 

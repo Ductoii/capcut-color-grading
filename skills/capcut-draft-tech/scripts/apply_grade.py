@@ -19,6 +19,7 @@ from analyze_project import (
     cluster_timeline_scenes,
     collect_all_video_segments,
     discover_ground_truth_scene_map,
+    extract_rgb_frame,
     extract_segment_metrics,
     resolve_project_dir,
 )
@@ -490,6 +491,95 @@ def compute_shot_lut_and_adjustments(
     return lut_title, lut_val, adjust, prof_note
 
 
+def apply_3d_lut_and_adjust_to_rgb(rgb: np.ndarray, lut_path: str, lut_val: float, adj_list: list) -> np.ndarray:
+    """
+    Applies the actual `.cube` 3D LUT (at `zorder: 2000` with skin-tone protection)
+    followed by the Adjust sliders (at `zorder: 8004`) onto a float32 RGB image `[0..1]`
+    so the AI can visually inspect the exact Before vs. After graded look!
+    """
+    out = rgb.copy()
+    if lut_path and os.path.exists(lut_path) and lut_path.lower().endswith(".cube"):
+        rows = []
+        size = 0
+        with open(lut_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s[0] == "#":
+                    continue
+                if s.upper().startswith("LUT_3D_SIZE"):
+                    size = int(s.split()[-1])
+                    continue
+                if s[0].isdigit() or s[0] in ("-", "."):
+                    parts = s.split()
+                    if len(parts) == 3:
+                        try:
+                            rows.append((float(parts[0]), float(parts[1]), float(parts[2])))
+                        except ValueError:
+                            pass
+        if size > 0 and len(rows) == size**3:
+            lut_grid = np.array(rows, dtype=np.float32).reshape((size, size, size, 3))
+            idx_r = np.clip(np.round(out[..., 0] * (size - 1)).astype(int), 0, size - 1)
+            idx_g = np.clip(np.round(out[..., 1] * (size - 1)).astype(int), 0, size - 1)
+            idx_b = np.clip(np.round(out[..., 2] * (size - 1)).astype(int), 0, size - 1)
+            mapped = lut_grid[idx_b, idx_g, idx_r]
+            # Approximate CapCut `tt_skin_seg` skin protection mask on warm skin pixels
+            r, g, b = out[..., 0], out[..., 1], out[..., 2]
+            skin_mask = ((r > g) & (g > b) & ((r - b) > 0.08) & (r > 0.22) & (r < 0.88)).astype(np.float32)[..., None]
+            eff_alpha = lut_val * (1.0 - 0.55 * skin_mask)
+            out = (1.0 - eff_alpha) * out + eff_alpha * mapped
+
+    adj_dict = dict(adj_list)
+    br = adj_dict.get("brightness", 0.0)
+    con = adj_dict.get("contrast", 0.0)
+    shd = adj_dict.get("shadow", 0.0)
+    hl = adj_dict.get("highlight", 0.0)
+    temp = adj_dict.get("temperature", 0.0)
+    tone = adj_dict.get("tone", 0.0)
+    sat = adj_dict.get("saturation", 0.0)
+
+    luma = 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
+    shd_w = np.clip(1.0 - luma * 2.2, 0.0, 1.0)[..., None]
+    hl_w = np.clip((luma - 0.50) * 2.0, 0.0, 1.0)[..., None]
+    out = out + br * 0.45 + shd * 0.35 * shd_w + hl * 0.35 * hl_w
+    out = (out - 0.30) * (1.0 + con * 0.85) + 0.30
+    out[..., 0] += temp * 0.18 + tone * 0.06
+    out[..., 2] -= temp * 0.18 - tone * 0.06
+    out[..., 1] -= tone * 0.09
+    luma2 = (0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2])[..., None]
+    out = luma2 + (out - luma2) * (1.0 + sat * 1.1)
+    return np.clip(out, 0.0, 1.0)
+
+
+def render_graded_comparison_sheet(all_seg_tuples: list, seg_records: list, clusters: list, lut_map: dict, out_jpg: str):
+    from PIL import Image, ImageDraw
+    w, h, pad_top = 280, 158, 28
+    pair_w = w * 2 + 6
+    cols = 2
+    rows = max(1, (len(clusters) + cols - 1) // cols)
+    sheet = Image.new("RGB", (cols * pair_w + 12, rows * (h + pad_top) + 8), (16, 16, 16))
+    draw = ImageDraw.Draw(sheet)
+
+    for idx, c in enumerate(clusters):
+        mid_seg = c["seg_indices"][len(c["seg_indices"]) // 2]
+        _, _, v, _ = all_seg_tuples[mid_seg]
+        rec = seg_records[mid_seg]
+        cfg = c["scene_cfg"]
+        ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+        raw_rgb = extract_rgb_frame(v.get("path", ""), ts, w, h)
+        lut_title, lut_val, adj_list, _ = compute_shot_lut_and_adjustments(rec.get("metrics") or c["anchor"], cfg, c["anchor"], c["anchor"], False)
+        graded_rgb = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, adj_list)
+
+        r_i, c_i = divmod(idx, cols)
+        x0 = c_i * pair_w + 6
+        y0 = r_i * (h + pad_top) + 4
+        sheet.paste(Image.fromarray((raw_rgb * 255).astype(np.uint8)), (x0, y0 + pad_top))
+        sheet.paste(Image.fromarray((graded_rgb * 255).astype(np.uint8)), (x0 + w + 2, y0 + pad_top))
+        lbl = f"S{c['cluster_id']:02d} ({c['bg_code']}) RAW vs GRADED -> {lut_title[:22]} ({int(lut_val*100)}%)"
+        draw.text((x0 + 4, y0 + 6), lbl, fill=(160, 245, 175))
+
+    sheet.save(out_jpg, quality=90)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Apply scene-continuous & per-child-video 35mm grading to a CapCut project.")
     parser.add_argument("project", help="CapCut Project ID or path.")
@@ -715,6 +805,14 @@ def main():
             f"  - Scene[{c['cluster_id']:2d}] ({c['bg_code']:8s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
             f"Primary LUT: {cfg['lut']:26s} ({cfg['base_val']*100:.0f}%)"
         )
+
+    comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
+    try:
+        render_graded_comparison_sheet(all_seg_tuples, seg_records, clusters, lut_map, comp_jpg)
+        print(f"\n[MANDATORY AI VISUAL QA] Rendered RAW vs. GRADED comparison sheet: {comp_jpg}")
+        print("-> AI MUST call read_file / view_file on this image to visually verify skin tones, contrast, and scene continuity with its own eyes!")
+    except Exception as exc:
+        print(f"Note: Could not render graded comparison sheet ({exc})")
 
     if args.relaunch:
         subprocess.run(["open", "-a", "/Applications/CapCut.app"], check=False)

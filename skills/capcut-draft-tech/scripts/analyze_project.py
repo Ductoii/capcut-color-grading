@@ -309,6 +309,42 @@ def collect_all_video_segments(root_draft: dict) -> list[tuple[dict, dict, dict,
     return collected
 
 
+def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180) -> np.ndarray:
+    cmd = [
+        "ffmpeg", "-v", "error", "-ss", f"{max(0.0, ts_sec):.2f}", "-i", video_path,
+        "-vf", f"scale={w}:{h}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+    ]
+    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    if len(raw) >= w * h * 3:
+        return np.frombuffer(raw[:w * h * 3], dtype=np.uint8).reshape((h, w, 3)).astype(np.float32) / 255.0
+    return np.zeros((h, w, 3), dtype=np.float32)
+
+
+def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clusters: list, out_jpg: str):
+    from PIL import Image, ImageDraw
+    w, h, pad_top = 320, 180, 26
+    cols = 4
+    rows = max(1, (len(clusters) + cols - 1) // cols)
+    sheet = Image.new("RGB", (cols * w, rows * (h + pad_top)), (18, 18, 18))
+    draw = ImageDraw.Draw(sheet)
+
+    for idx, c in enumerate(clusters):
+        mid_seg = c["seg_indices"][len(c["seg_indices"]) // 2]
+        _, _, v, _ = all_seg_tuples[mid_seg]
+        rec = seg_records[mid_seg]
+        ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+        rgb = extract_rgb_frame(v.get("path", ""), ts, w, h)
+        tile = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8))
+        r_i, c_i = divmod(idx, cols)
+        x0, y0 = c_i * w, r_i * (h + pad_top)
+        sheet.paste(tile, (x0, y0 + pad_top))
+        a = c["anchor"]
+        lbl = f"S{c['cluster_id']:02d} ({c['bg_code']}) Seg {c['start_seg']}..{c['end_seg']} | Mid:{a['mid']:.2f} RB:{a['rb']:+.2f}"
+        draw.text((x0 + 6, y0 + 6), lbl, fill=(240, 220, 140))
+
+    sheet.save(out_jpg, quality=88)
+
+
 def resolve_project_dir(project_arg: str) -> str:
     if os.path.isdir(project_arg):
         return os.path.abspath(project_arg)
@@ -393,16 +429,25 @@ def main():
                 f"Mid={mid_v:.3f} (dMid={d_mid:+.3f}) | R-B={rb_v:+.3f} (dRB={d_rb:+.3f})"
             )
 
+    preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
+    try:
+        render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg)
+        print(f"\n[MANDATORY AI VISUAL CHECK] Rendered raw scene contact sheet: {preview_jpg}")
+        print("-> AI MUST call read_file / view_file on this image to visually inspect the raw scene colors & lighting before grading!")
+    except Exception as exc:
+        print(f"Note: Could not render raw scene preview sheet ({exc})")
+
     if args.out:
         payload = {
             "ground_truth_source": gt_path,
+            "raw_preview_sheet": preview_jpg,
             "clip_bg_map": {str(k): v for k, v in clip_bg_map.items()},
             "segments": seg_records,
         }
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         print(f"\nSaved {len(seg_records)} segment-level diagnostics to {args.out}")
-        print("REMINDER: Ask the user (1) Model Source / Outlier confirmation and (2) Emotional Direction before running apply_grade.py!")
+        print("REMINDER: (1) View the raw scene sheet image with read_file/view_file, (2) Ask the user Model Source & Emotional Direction before running apply_grade.py!")
 
 
 if __name__ == "__main__":
