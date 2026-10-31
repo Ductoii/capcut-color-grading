@@ -96,7 +96,29 @@ For every child video segment `Seg[idx]` (measured over its actual `source_timer
 
 ---
 
-## 4. Reference Baseline: Typical Model Tendencies (Context Only — Always Measure)
+## 4. Strict 5-Tier Guardrails for the 1,636 LUT Library & CapCut `tt_skin_seg` Skin Protection
+
+All **1,636 LUTs** in `resources/luts/` are profiled in `lut_optical_db.json` with a mandatory `"tier"` classification. **NEVER pick LUTs randomly across tiers!** Follow these strict rules:
+
+1. **Always Enable CapCut Neural Skin Tone Protection (`"enable_skin_tone_correction": true`)**:
+   - Inside `AmazingFilter_lut/featureAlgorithmConfig/algorithmConfig.json` (`zorder: 2000`), CapCut runs the neural segmentation network `tt_skin_seg` (`skin_seg_0` at `360x640`) to mask human skin (`face, neck, hands`) and protect actors' skin hues from background LUT casts.
+   - Because `tt_skin_seg` protects skin hue, stylized environment LUTs (`Tier 2`) can be safely used on dramatic/climax scenes without turning human faces green, cyan, or purple—**provided intensity is capped at `<= 0.24` (`24%`)**.
+2. **The 5 Strict LUT Tiers (`lut_optical_db.json`)**:
+   - **Tier 1 — `cinema_rec709` (`509 LUTs`: Natural 35mm Cinema Rec.709)**:
+     - **Rule**: **DEFAULT (`100%` unlocked)** for all standard narrative, dialogue, warm-human, luxury-crisp, and vintage-35mm scenes, as well as all intra-scene angle-jump counter-balancing (`base_val ≈ 0.26–0.30`).
+   - **Tier 2 — `stylized_rec709` (`382 LUTs`: Stylized / Atmospheric / Teal-Orange Rec.709 with valid `blk < mid < hi`)**:
+     - **Rule**: **ONLY unlocked** for high-tension confrontation / climax scenes (`climax-punch`, `dramatic-contrast`) or when `--allow-stylized` is passed.
+     - **Mandatory Safeguard**: Must force `"enable_skin_tone_correction": true` (`tt_skin_seg`) AND cap LUT `value <= 0.24` so the environment gets stylized tension while actors' skin stays natural.
+   - **Tier 3 — `bw_mono` (`45 LUTs`: Black & White / Monochrome / Sepia)**:
+     - **Rule**: **LOCKED by default**. ONLY unlock (`--allow-bw` or custom plan override) when the script or user explicitly requests a **Flashback / Memory / Noir** sequence. Never apply to normal color scenes.
+   - **Tier 4 — `camera_log` (`548 LUTs`: `Sony S-Log2/3`, `ARRI LogC`, `Panasonic V-Log`, `Fuji F-Log`, `DJI D-Log`, `REDLog`, `BMDFilm`)**:
+     - **Rule**: **100% FORBIDDEN on AI-generated videos** (`Seedance 2.5`, `Google Omni 1.1`, `Grok`), because AI generators output gamma-encoded **Rec.709 / sRGB**, NOT flat camera Log curves (applying Log LUTs to Rec.709 crushes shadows and clips highlights). ONLY unlock (`--input-color-space log`) if the user explicitly confirms raw flat Log footage from a physical cinema camera.
+   - **Tier 5 — `extreme_clipped` (`152 LUTs`: Non-monotonic / Clipped Exposure Special Effects)**:
+     - **Rule**: **100% LOCKED** for standard filmmaking; only use on explicit user request for nightmare/glitch/experimental shots.
+
+---
+
+## 5. Reference Baseline: Typical Model Tendencies (Context Only — Always Measure)
 
 | Characteristic | **Seedance 2.5** (Target Reference) | **Google Omni 1.1** (Typical Tendency) | **Grok Video** (Typical Tendency) |
 | :--- | :--- | :--- | :--- |

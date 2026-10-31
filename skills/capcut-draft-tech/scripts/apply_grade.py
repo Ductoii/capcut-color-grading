@@ -28,16 +28,12 @@ DEFAULT_EFFECT_CACHE = "/Users/daho100/Library/Containers/com.lemon.lvoverseas/D
 OPTICAL_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", "lut_optical_db.json")
 
 
-def load_optical_db(lut_map: dict, allowed_tiers: tuple[str, ...] = ("cinema_rec709",)) -> list[dict]:
+def load_optical_db(lut_map: dict) -> list[dict]:
     if not os.path.exists(OPTICAL_DB_PATH):
         return []
     with open(OPTICAL_DB_PATH, "r", encoding="utf-8") as f:
         db = json.load(f)
-    return [
-        entry for entry in db
-        if entry.get("title") in lut_map
-        and (not allowed_tiers or entry.get("tier", "cinema_rec709") in allowed_tiers)
-    ]
+    return [entry for entry in db if entry.get("title") in lut_map]
 
 VERSION_MAP = {
     "lut": "",
@@ -167,35 +163,52 @@ def match_optimal_lut_from_db(
     desired_sat_gain: float,
     preferred_families: tuple[str, ...],
     fallback_lut: str,
-) -> str:
+    allowed_tiers: tuple[str, ...] = ("cinema_rec709",),
+) -> tuple[str, str]:
     """
-    Dynamically search all 508 Cinema-Safe Rec.709 LUTs in `lut_optical_db.json`
-    to find the 3D LUT whose measured transfer curve (`blk, mid, midRB, sknGM, satGain`)
-    best bridges the raw footage to the Scene Target.
+    Dynamically search the 1,636 LUT database (`lut_optical_db.json`) with STRICT TIER GUARDRAILS:
+    - Tier 1 (`cinema_rec709`, 509 LUTs): Default for all standard narrative scenes.
+    - Tier 2 (`stylized_rec709`, 382 LUTs): Only unlocked for climax/atmospheric scenes (`climax-punch` or `--allow-stylized`),
+      relying on CapCut's neural `tt_skin_seg` (`enable_skin_tone_correction: true`) to protect actors' skin tones while capping LUT intensity <= 0.24.
+    - Tier 3 (`bw_mono`, 45 LUTs): Locked unless explicitly requested for flashback/noir (`--allow-bw`).
+    - Tier 4 (`camera_log`, 548 LUTs): 100% blocked on Rec.709 AI video; only unlocked via `--input-color-space log`.
+    - Tier 5 (`extreme_clipped`, 152 LUTs): 100% blocked unless `--allow-extreme`.
     """
     if not optical_db:
-        return fallback_lut
+        return fallback_lut, "cinema_rec709"
     best_title = fallback_lut
+    best_tier = "cinema_rec709"
     best_score = 1e9
     for entry in optical_db:
+        tier = entry.get("tier", "cinema_rec709")
+        if allowed_tiers and tier not in allowed_tiers:
+            continue
         t = entry["title"]
         t_up = t.upper()
-        # Optical distance between LUT transfer curve and desired correction
         d_mid = abs(entry["mid"] - desired_mid) * 2.2
         d_rb = abs(entry["midRB"] - desired_mid_rb) * 3.0
         d_blk = abs(entry["blk"] - desired_blk) * 2.5
         d_sat = abs(entry["satGain"] - desired_sat_gain) * 0.6
-        # Reward natural rosy skin (-0.045 <= sknGM <= -0.015)
-        d_skn = abs(entry["sknGM"] - (-0.028)) * 1.5
+        # When `tt_skin_seg` (`enable_skin_tone_correction: true`) is active, stylized_rec709 LUTs
+        # are penalized much less on raw skin GM, but `cinema_rec709` still gets a safety preference
+        d_skn = abs(entry["sknGM"] - (-0.028)) * (1.2 if tier == "cinema_rec709" else 0.5)
+        tier_penalty = 0.0 if tier == "cinema_rec709" else 0.022
         fam_bonus = -0.035 if any(k in t_up for k in preferred_families) else 0.0
-        score = d_mid + d_rb + d_blk + d_sat + d_skn + fam_bonus
+        score = d_mid + d_rb + d_blk + d_sat + d_skn + tier_penalty + fam_bonus
         if score < best_score:
             best_score = score
             best_title = t
-    return best_title
+            best_tier = tier
+    return best_title, best_tier
 
 
-def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ratio: float, optical_db: list[dict] = None) -> dict:
+def select_scene_primary_lut_and_targets(
+    anchor: dict,
+    emotion: str,
+    progress_ratio: float,
+    optical_db: list[dict] = None,
+    extra_tiers: tuple[str, ...] = (),
+) -> dict:
     p5 = anchor.get("p5", 0.05)
     mid = anchor.get("mid", 0.28)
     p95 = anchor.get("p95", 0.62)
@@ -235,11 +248,15 @@ def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ra
     target_sat = clamp(sat, 0.140, 0.185)
     use_vignette = (act_mood in ("dramatic-contrast", "climax-punch") and target_mid < 0.32)
 
-    # Ideal LUT response at zorder 2000 (given reference input mid=0.28, blk=0.05, rb=0.00):
     desired_lut_mid = clamp(0.28 + (target_mid - mid) * 0.85, 0.18, 0.42)
     desired_lut_rb = clamp((target_rb - rb) * 0.90, -0.05, 0.08)
     desired_lut_blk = clamp(0.048 - (p5 - 0.050) * 0.65, 0.015, 0.085)
     desired_sat_gain = clamp(1.0 + (0.48 - hsv_s) * 0.65, 0.80, 1.28)
+
+    # Guardrail: Normal scenes strictly use `cinema_rec709`; climax/tension scenes also unlock `stylized_rec709` (protected by `tt_skin_seg`)
+    scene_tiers = ("cinema_rec709", "stylized_rec709") if act_mood in ("climax-punch", "dramatic-contrast") else ("cinema_rec709",)
+    if extra_tiers:
+        scene_tiers = tuple(dict.fromkeys(scene_tiers + extra_tiers))
 
     if p5 > 0.125 and mid > 0.42 and rb < 0.095:
         fb_lut, base_val, prof, fams = "CINEMATIC  (3).cube", 0.29, f"[{act_mood}] Scene High-Key / Night Toe Anchor", ("CINEMATIC", "DRAMATIC", "FILM LOOK")
@@ -265,11 +282,17 @@ def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ra
         fb_lut = "SKINTONE (4).cube" if (mid >= 0.30 and 0.08 <= rb <= 0.155 and p5 < 0.11) else "LUT 3 Luxury - rec709.cube"
         base_val, prof, fams = 0.27, "[luxury-crisp] Scene Grand Luxury & Skintone", ("SKINTONE", "LUT ", "COMMERCIAL", "CINEMATIC")
 
-    lut = match_optimal_lut_from_db(optical_db, desired_lut_mid, desired_lut_rb, desired_lut_blk, desired_sat_gain, fams, fb_lut)
+    lut, picked_tier = match_optimal_lut_from_db(
+        optical_db, desired_lut_mid, desired_lut_rb, desired_lut_blk, desired_sat_gain, fams, fb_lut, allowed_tiers=scene_tiers
+    )
+    if picked_tier == "stylized_rec709":
+        # Guardrail: Cap intensity <= 0.24 when using a stylized LUT (skin is protected by tt_skin_seg)
+        base_val = min(base_val, 0.24)
 
     return {
         "act_mood": act_mood,
         "lut": lut,
+        "lut_tier": picked_tier,
         "base_val": base_val,
         "profile": prof,
         "target_mid": target_mid,
@@ -328,11 +351,12 @@ def compute_shot_lut_and_adjustments(
         shot_des_blk = clamp(0.048 - (p5 - 0.050) * 0.70, 0.015, 0.085)
         shot_des_sat = clamp(1.0 + (0.48 - hsv_s) * 0.65, 0.80, 1.28)
         fb = "DRAMATIC (14).cube" if d_mid_scene < -0.058 else ("CINEMATIC  (27).cube" if d_rb_scene > 0.040 else "SCC-rec709 (23).cube")
-        lut_title = match_optimal_lut_from_db(
+        lut_title, picked_tier = match_optimal_lut_from_db(
             optical_db, shot_des_mid, shot_des_rb, shot_des_blk, shot_des_sat,
-            ("CINEMATIC", "DRAMATIC", "FILM LOOK", "SCC-REC709", "SKINTONE", "MOOD"), fb
+            ("CINEMATIC", "DRAMATIC", "FILM LOOK", "SCC-REC709", "SKINTONE", "MOOD"), fb,
+            allowed_tiers=("cinema_rec709",),
         )
-        base_val = 0.28
+        base_val = 0.24 if picked_tier == "stylized_rec709" else 0.28
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Counter-Balance]"
 
     nb_mid_diff = mid - local_neighbor_m.get("mid", mid)
@@ -417,6 +441,9 @@ def main():
     parser.add_argument("--plan", default="", help="Optional custom AI grading plan JSON path.")
     parser.add_argument("--match-clips", default="", help="Optional comma-separated clips to strongly match to immediate neighbors.")
     parser.add_argument("--auto-match-outliers", action="store_true", help="Automatically boost neighbor-matching on intra-scene outlier segments.")
+    parser.add_argument("--allow-stylized", action="store_true", help="Unlock Tier 2 (stylized_rec709, 382 LUTs) with CapCut tt_skin_seg Skin Protection.")
+    parser.add_argument("--allow-bw", action="store_true", help="Unlock Tier 3 (bw_mono, 45 LUTs) for flashback/noir sequences.")
+    parser.add_argument("--input-color-space", choices=["rec709", "log"], default="rec709", help="Input color space (rec709 for all AI video; log only for real camera Log).")
     parser.add_argument("--relaunch", action="store_true", help="Quit CapCut before writing and relaunch after completion.")
     args = parser.parse_args()
 
@@ -518,12 +545,21 @@ def main():
 
     # 2. Ground-Truth Scene Clustering + Per-Child-Video (`video con`) LUT & Full Adjust Stack
     optical_db = load_optical_db(lut_map)
+    extra_tiers = []
+    if args.allow_stylized:
+        extra_tiers.append("stylized_rec709")
+    if args.allow_bw:
+        extra_tiers.append("bw_mono")
+    if args.input_color_space == "log":
+        extra_tiers.append("camera_log")
     clusters = cluster_timeline_scenes(seg_records, clip_bg_map)
     seg_to_cluster = {}
     total_segs = max(len(all_seg_tuples), 1)
     for c in clusters:
         mid_prog = 0.5 * (c["start_seg"] + c["end_seg"]) / total_segs
-        c["scene_cfg"] = select_scene_primary_lut_and_targets(c["anchor"], args.emotion, mid_prog, optical_db=optical_db)
+        c["scene_cfg"] = select_scene_primary_lut_and_targets(
+            c["anchor"], args.emotion, mid_prog, optical_db=optical_db, extra_tiers=tuple(extra_tiers)
+        )
         for s_idx in c["seg_indices"]:
             seg_to_cluster[s_idx] = c
 
