@@ -25,6 +25,15 @@ from analyze_project import (
 
 LUT_CFG_PATH = "/Users/daho100/Movies/CapCut/User Data/Resources/Lut/LutImportCfg.json"
 DEFAULT_EFFECT_CACHE = "/Users/daho100/Library/Containers/com.lemon.lvoverseas/Data/Movies/CapCut/User Data/Cache/effect/7501974767453474064/26e574bcfa176c3c1a1f7fd5df0a4996"
+OPTICAL_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", "lut_optical_db.json")
+
+
+def load_optical_db(lut_map: dict) -> list[dict]:
+    if not os.path.exists(OPTICAL_DB_PATH):
+        return []
+    with open(OPTICAL_DB_PATH, "r", encoding="utf-8") as f:
+        db = json.load(f)
+    return [entry for entry in db if entry.get("title") in lut_map]
 
 VERSION_MAP = {
     "lut": "",
@@ -146,7 +155,43 @@ def make_effect(eff_type: str, value: float, lut_map: dict, effect_cache: str, l
     }
 
 
-def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ratio: float) -> dict:
+def match_optimal_lut_from_db(
+    optical_db: list[dict],
+    desired_mid: float,
+    desired_mid_rb: float,
+    desired_blk: float,
+    desired_sat_gain: float,
+    preferred_families: tuple[str, ...],
+    fallback_lut: str,
+) -> str:
+    """
+    Dynamically search all 508 Cinema-Safe Rec.709 LUTs in `lut_optical_db.json`
+    to find the 3D LUT whose measured transfer curve (`blk, mid, midRB, sknGM, satGain`)
+    best bridges the raw footage to the Scene Target.
+    """
+    if not optical_db:
+        return fallback_lut
+    best_title = fallback_lut
+    best_score = 1e9
+    for entry in optical_db:
+        t = entry["title"]
+        t_up = t.upper()
+        # Optical distance between LUT transfer curve and desired correction
+        d_mid = abs(entry["mid"] - desired_mid) * 2.2
+        d_rb = abs(entry["midRB"] - desired_mid_rb) * 3.0
+        d_blk = abs(entry["blk"] - desired_blk) * 2.5
+        d_sat = abs(entry["satGain"] - desired_sat_gain) * 0.6
+        # Reward natural rosy skin (-0.045 <= sknGM <= -0.015)
+        d_skn = abs(entry["sknGM"] - (-0.028)) * 1.5
+        fam_bonus = -0.035 if any(k in t_up for k in preferred_families) else 0.0
+        score = d_mid + d_rb + d_blk + d_sat + d_skn + fam_bonus
+        if score < best_score:
+            best_score = score
+            best_title = t
+    return best_title
+
+
+def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ratio: float, optical_db: list[dict] = None) -> dict:
     p5 = anchor.get("p5", 0.05)
     mid = anchor.get("mid", 0.28)
     p95 = anchor.get("p95", 0.62)
@@ -186,37 +231,37 @@ def select_scene_primary_lut_and_targets(anchor: dict, emotion: str, progress_ra
     target_sat = clamp(sat, 0.140, 0.185)
     use_vignette = (act_mood in ("dramatic-contrast", "climax-punch") and target_mid < 0.32)
 
+    # Ideal LUT response at zorder 2000 (given reference input mid=0.28, blk=0.05, rb=0.00):
+    desired_lut_mid = clamp(0.28 + (target_mid - mid) * 0.85, 0.18, 0.42)
+    desired_lut_rb = clamp((target_rb - rb) * 0.90, -0.05, 0.08)
+    desired_lut_blk = clamp(0.048 - (p5 - 0.050) * 0.65, 0.015, 0.085)
+    desired_sat_gain = clamp(1.0 + (0.48 - hsv_s) * 0.65, 0.80, 1.28)
+
     if p5 > 0.125 and mid > 0.42 and rb < 0.095:
-        lut, base_val, prof = "CINEMATIC  (3).cube", 0.29, f"[{act_mood}] Scene High-Key / Night Toe Anchor"
+        fb_lut, base_val, prof, fams = "CINEMATIC  (3).cube", 0.29, f"[{act_mood}] Scene High-Key / Night Toe Anchor", ("CINEMATIC", "DRAMATIC", "FILM LOOK")
     elif mid < 0.225 and rb < 0.125:
-        lut, base_val, prof = "FILM LOOK (19).cube", 0.29, f"[{act_mood}] Scene Low-Key Night Shadow Lift"
+        fb_lut, base_val, prof, fams = "FILM LOOK (19).cube", 0.29, f"[{act_mood}] Scene Low-Key Night Shadow Lift", ("FILM LOOK", "DRAMATIC", "ATMOSPHERIC")
     elif mid <= 0.240 and rb >= 0.125:
-        lut, base_val, prof = "DRAMATIC (14).cube", 0.29, f"[{act_mood}] Scene Dark Warm Interior Lift"
+        fb_lut, base_val, prof, fams = "DRAMATIC (14).cube", 0.29, f"[{act_mood}] Scene Dark Warm Interior Lift", ("DRAMATIC", "FILM LOOK", "CINEMATIC")
     elif rb >= 0.168:
-        lut, base_val, prof = "CINEMATIC  (27).cube", 0.27, f"[{act_mood}] Scene Heavy Amber Counter-Balance"
+        fb_lut, base_val, prof, fams = "CINEMATIC  (27).cube", 0.27, f"[{act_mood}] Scene Heavy Amber Counter-Balance", ("CINEMATIC", "SKINTONE", "COMMERCIAL")
     elif act_mood == "warm-human":
-        if mid > 0.38 or rb < 0.09:
-            lut, base_val, prof = "LUT 1 Life - rec709.cube", 0.28, "[warm-human] Scene Golden Sunlight & Empathy"
-        else:
-            lut, base_val, prof = "Mood 9 Skin rec709.cube", 0.27, "[warm-human] Scene Luminous Rosy Skintone"
+        fb_lut = "LUT 1 Life - rec709.cube" if (mid > 0.38 or rb < 0.09) else "Mood 9 Skin rec709.cube"
+        base_val, prof, fams = 0.28, "[warm-human] Scene Luminous Empathy & Skintone", ("MOOD", "SKINTONE", "LUT ", "WARM", "THE ROMANCE")
     elif act_mood == "climax-punch":
-        if hsv_s < 0.42 or rb < 0.125:
-            lut, base_val, prof = "SCC-rec709 (23).cube", 0.29, "[climax-punch] Scene Climax Color Revival"
-        else:
-            lut, base_val, prof = "FILM LOOK (4).cube", 0.28, "[climax-punch] Scene Crisp 35mm Confrontation"
+        fb_lut = "SCC-rec709 (23).cube" if (hsv_s < 0.42 or rb < 0.125) else "FILM LOOK (4).cube"
+        base_val, prof, fams = 0.28, "[climax-punch] Scene Crisp 35mm Confrontation", ("SCC-REC709", "FILM LOOK", "HOLLYWOOD", "DRAMATIC")
     elif act_mood == "dramatic-contrast":
-        if rb < 0.115 and mid > 0.25:
-            lut, base_val, prof = "CINEMATIC  (9).cube", 0.27, "[dramatic-contrast] Scene Sleek Cool-Shadow Tension"
-        else:
-            lut, base_val, prof = "FILM LOOK (4).cube", 0.28, "[dramatic-contrast] Scene 35mm Teal-Shadow Drama"
+        fb_lut = "CINEMATIC  (9).cube" if (rb < 0.115 and mid > 0.25) else "FILM LOOK (4).cube"
+        base_val, prof, fams = 0.28, "[dramatic-contrast] Scene 35mm Tension & Depth", ("FILM LOOK", "CINEMATIC", "DRAMATIC", "HOLLYWOOD")
     elif act_mood == "vintage-35mm":
-        lut = "LUT 1 Life - rec709.cube" if rb < 0.13 else "LUT 3 Luxury - rec709.cube"
-        base_val, prof = 0.28, "[vintage-35mm] Scene Kodak 35mm Warm Print"
+        fb_lut = "LUT 1 Life - rec709.cube" if rb < 0.13 else "LUT 3 Luxury - rec709.cube"
+        base_val, prof, fams = 0.28, "[vintage-35mm] Scene Kodak 35mm Warm Print", ("VINTAGE", "FILM LOOK", "LUT ", "MOOD")
     else:
-        if mid >= 0.30 and 0.08 <= rb <= 0.155 and p5 < 0.11:
-            lut, base_val, prof = "SKINTONE (4).cube", 0.26, "[luxury-crisp] Scene Pure Natural Skintone"
-        else:
-            lut, base_val, prof = "LUT 3 Luxury - rec709.cube", 0.27, "[luxury-crisp] Scene Grand Chandelier Luxury"
+        fb_lut = "SKINTONE (4).cube" if (mid >= 0.30 and 0.08 <= rb <= 0.155 and p5 < 0.11) else "LUT 3 Luxury - rec709.cube"
+        base_val, prof, fams = 0.27, "[luxury-crisp] Scene Grand Luxury & Skintone", ("SKINTONE", "LUT ", "COMMERCIAL", "CINEMATIC")
+
+    lut = match_optimal_lut_from_db(optical_db, desired_lut_mid, desired_lut_rb, desired_lut_blk, desired_sat_gain, fams, fb_lut)
 
     return {
         "act_mood": act_mood,
@@ -237,14 +282,15 @@ def compute_shot_lut_and_adjustments(
     scene_anchor: dict,
     local_neighbor_m: dict,
     force_neighbor_match: bool = False,
+    optical_db: list[dict] = None,
 ) -> tuple[str, float, list, str]:
     """
     Solves intra-scene camera-angle color jumps!
     Because CapCut executes LUT FIRST (zorder 2000) and Adjust SECOND (zorder 8004):
     - Normal shots in the scene use `scene_cfg["lut"]`.
     - When a camera angle inside the scene jumps strongly in raw color/exposure (`dRB` or `dMid`),
-      it switches to the Counter-Balance Sibling LUT at zorder 2000 + Post-LUT Adjust at zorder 8004
-      so its final rendered pixels converge to the exact same Scene Target (`target_mid, target_rb, target_gm, target_sat`).
+      it searches the 508 Cinema-Safe Rec.709 LUT database for the Counter-Balance Sibling LUT at zorder 2000
+      + Post-LUT Adjust at zorder 8004 so its final rendered pixels converge to the exact same Scene Target.
     """
     p5 = m.get("p5", 0.05)
     p25 = m.get("p25", 0.15)
@@ -268,31 +314,22 @@ def compute_shot_lut_and_adjustments(
     d_rb_scene = rb - scene_anchor.get("rb", rb)
     d_mid_scene = mid - scene_anchor.get("mid", mid)
 
-    # Decide whether this specific shot had a strong camera-angle lighting jump within the scene
     lut_title = scene_cfg["lut"]
     base_val = scene_cfg["base_val"]
     prof_note = scene_cfg["profile"]
 
-    if d_mid_scene < -0.060 and mid < 0.205:
-        # Angle jumped into deep shadow (e.g., dark suit / dark corner close-up): lift at zorder 2000
-        lut_title = "DRAMATIC (14).cube" if rb >= 0.12 else "FILM LOOK (19).cube"
-        base_val = 0.30
-        prof_note = f"{scene_cfg['profile']} [Angle-Jump Shadow Lift]"
-    elif d_rb_scene > 0.040 and rb >= 0.162:
-        # Angle jumped toward heavy warm chandelier/tungsten: cool orange at zorder 2000
-        lut_title = "CINEMATIC  (27).cube"
+    if abs(d_mid_scene) > 0.058 or abs(d_rb_scene) > 0.040:
+        shot_des_mid = clamp(0.28 + (target_mid - mid) * 0.95, 0.18, 0.43)
+        shot_des_rb = clamp((target_rb - rb) * 1.05, -0.06, 0.09)
+        shot_des_blk = clamp(0.048 - (p5 - 0.050) * 0.70, 0.015, 0.085)
+        shot_des_sat = clamp(1.0 + (0.48 - hsv_s) * 0.65, 0.80, 1.28)
+        fb = "DRAMATIC (14).cube" if d_mid_scene < -0.058 else ("CINEMATIC  (27).cube" if d_rb_scene > 0.040 else "SCC-rec709 (23).cube")
+        lut_title = match_optimal_lut_from_db(
+            optical_db, shot_des_mid, shot_des_rb, shot_des_blk, shot_des_sat,
+            ("CINEMATIC", "DRAMATIC", "FILM LOOK", "SCC-REC709", "SKINTONE", "MOOD"), fb
+        )
         base_val = 0.28
-        prof_note = f"{scene_cfg['profile']} [Angle-Jump Amber Cool]"
-    elif d_rb_scene < -0.042 and rb < 0.095 and scene_anchor.get("rb", 0.13) >= 0.12:
-        # Angle jumped toward cold glass door / muted wall in a warm room: restore warmth at zorder 2000
-        lut_title = "SCC-rec709 (23).cube" if hsv_s < 0.44 else "LUT 1 Life - rec709.cube"
-        base_val = 0.28
-        prof_note = f"{scene_cfg['profile']} [Angle-Jump Warmth Restore]"
-    elif d_mid_scene > 0.065 and p5 > scene_anchor.get("p5", 0.05) + 0.045:
-        # Angle jumped toward bright window / milky flare: anchor toe at zorder 2000
-        lut_title = "CINEMATIC  (3).cube"
-        base_val = 0.28
-        prof_note = f"{scene_cfg['profile']} [Angle-Jump Toe Anchor]"
+        prof_note = f"{scene_cfg['profile']} [Angle-Jump Counter-Balance]"
 
     nb_mid_diff = mid - local_neighbor_m.get("mid", mid)
     nb_rb_diff = rb - local_neighbor_m.get("rb", rb)
@@ -476,12 +513,13 @@ def main():
                     seg["enable_adjust"] = True
 
     # 2. Ground-Truth Scene Clustering + Per-Child-Video (`video con`) LUT & Full Adjust Stack
+    optical_db = load_optical_db(lut_map)
     clusters = cluster_timeline_scenes(seg_records, clip_bg_map)
     seg_to_cluster = {}
     total_segs = max(len(all_seg_tuples), 1)
     for c in clusters:
         mid_prog = 0.5 * (c["start_seg"] + c["end_seg"]) / total_segs
-        c["scene_cfg"] = select_scene_primary_lut_and_targets(c["anchor"], args.emotion, mid_prog)
+        c["scene_cfg"] = select_scene_primary_lut_and_targets(c["anchor"], args.emotion, mid_prog, optical_db=optical_db)
         for s_idx in c["seg_indices"]:
             seg_to_cluster[s_idx] = c
 
@@ -518,7 +556,7 @@ def main():
                 args.auto_match_outliers
                 and (abs(m["rb"] - scene_anchor["rb"]) > 0.045 or abs(m["mid"] - scene_anchor["mid"]) > 0.060)
             )
-            lut_title, val, adj_list, prof = compute_shot_lut_and_adjustments(m, scene_cfg, scene_anchor, local_nb_m, force_nb)
+            lut_title, val, adj_list, prof = compute_shot_lut_and_adjustments(m, scene_cfg, scene_anchor, local_nb_m, force_nb, optical_db=optical_db)
             if "Angle-Jump" in prof:
                 angle_jump_fixes += 1
 
