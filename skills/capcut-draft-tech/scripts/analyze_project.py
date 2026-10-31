@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Segment-level (source_timerange) 16-metric video diagnostics & Ground-Truth BANGTRA/Script Scene Mapping for CapCut projects."""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import numpy as np
+
+CAPCUT_PROJECTS_ROOT = "/Users/daho100/Movies/CapCut/User Data/Projects/com.lveditor.draft"
+
+
+def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: float = 5.0) -> dict:
+    """
+    Samples up to 3 frames strictly inside the segment's [start_sec, start_sec + dur_sec] window
+    on the timeline so camera-angle cuts inside a multi-shot clip are measured accurately.
+    """
+    if dur_sec <= 0.2:
+        sample_times = [max(0.0, start_sec + 0.5 * dur_sec)]
+    elif dur_sec <= 2.5:
+        sample_times = [max(0.0, start_sec + 0.35 * dur_sec), max(0.0, start_sec + 0.70 * dur_sec)]
+    else:
+        sample_times = [
+            max(0.0, start_sec + 0.20 * dur_sec),
+            max(0.0, start_sec + 0.50 * dur_sec),
+            max(0.0, start_sec + 0.80 * dur_sec),
+        ]
+
+    frames = []
+    for ts in sample_times:
+        cmd = [
+            "ffmpeg", "-v", "error", "-ss", f"{ts:.2f}", "-i", video_path,
+            "-vf", "scale=160:90", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        if len(raw) >= 160 * 90 * 3:
+            arr = np.frombuffer(raw[:160 * 90 * 3], dtype=np.uint8).reshape((90, 160, 3)).astype(np.float32) / 255.0
+            frames.append(arr)
+
+    if not frames:
+        cmd = [
+            "ffmpeg", "-v", "error", "-ss", "0.1", "-i", video_path,
+            "-vf", "scale=160:90", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        if len(raw) >= 160 * 90 * 3:
+            frames.append(np.frombuffer(raw[:160 * 90 * 3], dtype=np.uint8).reshape((90, 160, 3)).astype(np.float32) / 255.0)
+
+    if not frames:
+        return {
+            "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.26, "p50": 0.25, "p75": 0.38, "p95": 0.60, "p99": 0.74,
+            "contrast": 0.55, "iqr_ratio": 0.44, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
+            "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "sharp": 0.040, "hf_noise": 0.028
+        }
+
+    per_frame = []
+    for arr in frames:
+        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        p1, p5, p25, p50, p75, p95, p99 = np.percentile(luma, [1, 5, 25, 50, 75, 95, 99])
+        mid = float(np.mean(luma))
+        contrast = float(p95 - p5)
+        iqr_ratio = float((p75 - p25) / max(contrast, 1e-4))
+        rb = float(np.mean(r - b))
+        shd_rb = float(np.mean((r - b)[luma <= p25]))
+        mid_rb = float(np.mean((r - b)[(luma > p25) & (luma < p75)]))
+        hi_rb = float(np.mean((r - b)[luma >= p75]))
+        gm = float(np.mean(g - 0.5 * (r + b)))
+        cmax = np.max(arr, axis=2)
+        cmin = np.min(arr, axis=2)
+        chroma = cmax - cmin
+        sat = float(np.mean(chroma))
+        hsv_s = float(np.mean(chroma / np.maximum(cmax, 1e-4)))
+        gx = np.abs(np.diff(luma, axis=1)).mean()
+        gy = np.abs(np.diff(luma, axis=0)).mean()
+        sharp = float(0.5 * (gx + gy))
+        blur = 0.25 * (luma[:-2, 1:-1] + luma[2:, 1:-1] + luma[1:-1, :-2] + luma[1:-1, 2:])
+        hf_noise = float(np.std(luma[1:-1, 1:-1] - blur))
+        per_frame.append({
+            "p1": p1, "p5": p5, "p25": p25, "mid": mid, "p50": p50, "p75": p75, "p95": p95, "p99": p99,
+            "contrast": contrast, "iqr_ratio": iqr_ratio, "rb": rb, "shd_rb": shd_rb, "mid_rb": mid_rb,
+            "hi_rb": hi_rb, "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise
+        })
+
+    keys = per_frame[0].keys()
+    return {k: round(float(np.mean([f[k] for f in per_frame])), 4) for k in keys}
+
+
+def extract_clip_number(mname: str) -> int:
+    m_v = re.search(r"V-(\d+)", mname, re.IGNORECASE)
+    if m_v:
+        return int(m_v.group(1))
+    m_sc = re.search(r"scene_(\d+)", mname, re.IGNORECASE)
+    if m_sc:
+        return int(m_sc.group(1))
+    m_num = re.match(r"(\d+)", mname)
+    if m_num:
+        return int(m_num.group(1))
+    return -1
+
+
+def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
+    """
+    Searches the video folders and parent folders for ground-truth script files:
+    - sf-board.json (SF Board .project)
+    - *BANGTRA*.txt
+    - *PROMPT*.txt
+    Returns (clip_num_to_base_bg_dict, source_file_path).
+    Crucially normalizes camera angles of the same room (e.g. BG1a and BG1b -> BG1)
+    so reverse angles in the same location share one unified Scene Target!
+    """
+    search_dirs = set()
+    for vp in video_paths:
+        if not vp:
+            continue
+        cur = os.path.dirname(vp)
+        for _ in range(4):
+            if os.path.isdir(cur) and cur not in ("/", "/Users", "/Users/daho100"):
+                search_dirs.add(cur)
+            cur = os.path.dirname(cur)
+
+    # 1. Check sf-board.json
+    for sdir in sorted(search_dirs):
+        sfb = os.path.join(sdir, "sf-board.json")
+        if os.path.exists(sfb):
+            try:
+                data = json.load(open(sfb, "r", encoding="utf-8"))
+                clip_map = {}
+                for sc in data.get("scenes", []):
+                    sc_id = sc.get("id", "")
+                    sc_title = sc.get("name") or sc.get("title") or sc_id
+                    for sf in sc.get("sfs", []):
+                        cid = sf.get("id", "")
+                        m = re.search(r"V-(\d+)", cid)
+                        if m:
+                            cnum = int(m.group(1))
+                            bgs = sf.get("refs", {}).get("bgs", [])
+                            base_bg = re.sub(r"[a-z]$", "", bgs[0]) if bgs else sc_id
+                            clip_map[cnum] = f"{base_bg}:{sc_title[:30]}"
+                if clip_map:
+                    return clip_map, sfb
+            except Exception:
+                pass
+
+    # 2. Check *BANGTRA*.txt or *PROMPT*.txt
+    candidates = []
+    for sdir in sorted(search_dirs):
+        candidates.extend(sorted(glob.glob(os.path.join(sdir, "*BANGTRA*.txt"))))
+        candidates.extend(sorted(glob.glob(os.path.join(sdir, "*PROMPT*.txt"))))
+
+    for cfile in candidates:
+        if "ANH_REF" in os.path.basename(cfile):
+            continue
+        try:
+            lines = open(cfile, "r", encoding="utf-8", errors="ignore").readlines()
+            clip_map = {}
+            current_header = "SCENE"
+            for line in lines:
+                line_s = line.strip()
+                if line_s.startswith("----") and line_s.endswith("----"):
+                    hdr = line_s.strip("- ").split("(")[0].strip()
+                    current_header = hdr
+                    continue
+                # Match table row: "001 | 30 | 9 | BG1a, CHAR1a..."
+                m_row = re.match(r"^(\d{1,3})\s*\|\s*\d+\s*\|\s*\d+\s*\|\s*([^|]+)\|", line_s)
+                if m_row:
+                    cnum = int(m_row.group(1))
+                    refs_str = m_row.group(2)
+                    m_bg = re.search(r"(BG\d+)[a-z]?", refs_str)
+                    clip_map[cnum] = m_bg.group(1) if m_bg else ""
+                    continue
+                # Match prompt line: "Scene 001: ... BG1a ..."
+                m_pr = re.match(r"^Scene\s+(\d{1,3})\s*:(.*)$", line_s, re.IGNORECASE)
+                if m_pr:
+                    cnum = int(m_pr.group(1))
+                    body = m_pr.group(2)
+                    m_bg = re.search(r"(BG\d+)[a-z]?", body)
+                    if m_bg:
+                        clip_map[cnum] = m_bg.group(1)
+            if len(clip_map) >= 10:
+                return clip_map, cfile
+        except Exception:
+            pass
+
+    return {}, ""
+
+
+def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None) -> list:
+    """
+    Groups consecutive timeline segments into Continuous Scene Clusters:
+    - Priority 1 (Ground-Truth): Uses clip_bg_map from BANGTRA.txt / sf-board.json (merging reverse angles BG1a/BG1b -> BG1).
+      Transition clips without a BG tag inherit the current scene's BG if surrounded by the same BG.
+    - Priority 2 (Visual Fallback): Uses a sustained multi-segment window only if no ground-truth map exists.
+    """
+    n = len(seg_records)
+    if n == 0:
+        return []
+
+    default_m = {
+        "p5": 0.05, "p25": 0.15, "mid": 0.28, "p95": 0.62, "p99": 0.76,
+        "contrast": 0.55, "rb": 0.13, "gm": -0.012, "sat": 0.15, "hsv_s": 0.45,
+        "sharp": 0.042, "hf_noise": 0.030
+    }
+    ms = [r.get("metrics") or default_m for r in seg_records]
+
+    if clip_bg_map:
+        # Assign each segment its ground-truth base BG code
+        raw_bgs = []
+        for r in seg_records:
+            cnum = extract_clip_number(r["material_name"])
+            raw_bgs.append(clip_bg_map.get(cnum, ""))
+
+        # Fill empty/transition clips from nearest known BG
+        for i in range(n):
+            if not raw_bgs[i]:
+                prev_bg = next((raw_bgs[j] for j in range(i - 1, -1, -1) if raw_bgs[j]), "")
+                next_bg = next((raw_bgs[j] for j in range(i + 1, n) if raw_bgs[j]), "")
+                raw_bgs[i] = prev_bg or next_bg or "BG_DEFAULT"
+
+        boundaries = [0]
+        for i in range(1, n):
+            if raw_bgs[i] != raw_bgs[i - 1]:
+                boundaries.append(i)
+        boundaries.append(n)
+        source_mode = "GROUND-TRUTH"
+    else:
+        boundaries = [0]
+        last_cut = 0
+        for i in range(1, n):
+            if seg_records[i]["material_name"] == seg_records[i - 1]["material_name"]:
+                continue
+            if i - last_cut < 4:
+                continue
+            w_prev = ms[max(last_cut, i - 4):i]
+            w_next = ms[i:min(n, i + 4)]
+            if len(w_next) < 2:
+                continue
+            prev_mid = float(np.median([x["mid"] for x in w_prev]))
+            next_mid = float(np.median([x["mid"] for x in w_next]))
+            prev_rb = float(np.median([x["rb"] for x in w_prev]))
+            next_rb = float(np.median([x["rb"] for x in w_next]))
+            prev_p5 = float(np.median([x["p5"] for x in w_prev]))
+            next_p5 = float(np.median([x["p5"] for x in w_next]))
+            next2_mid = ms[min(n - 1, i + 1)]["mid"]
+            next2_rb = ms[min(n - 1, i + 1)]["rb"]
+            sustained_shift = (
+                (abs(next_mid - prev_mid) > 0.070 and abs(next2_mid - prev_mid) > 0.052)
+                or (abs(next_rb - prev_rb) > 0.048 and abs(next2_rb - prev_rb) > 0.036)
+                or (abs(next_p5 - prev_p5) > 0.045)
+            )
+            if sustained_shift:
+                boundaries.append(i)
+                last_cut = i
+        boundaries.append(n)
+        raw_bgs = ["AUTO" for _ in range(n)]
+        source_mode = "VISUAL-FALLBACK"
+
+    clusters = []
+    for b_idx in range(len(boundaries) - 1):
+        s_idx, e_idx = boundaries[b_idx], boundaries[b_idx + 1]
+        c_ms = ms[s_idx:e_idx]
+        anchor = {k: round(float(np.median([x[k] for x in c_ms])), 4) for k in default_m}
+        clusters.append({
+            "cluster_id": b_idx,
+            "bg_code": raw_bgs[s_idx],
+            "source_mode": source_mode,
+            "start_seg": s_idx,
+            "end_seg": e_idx - 1,
+            "seg_indices": list(range(s_idx, e_idx)),
+            "clips": sorted(set(seg_records[j]["material_name"] for j in range(s_idx, e_idx))),
+            "anchor": anchor,
+        })
+
+    return clusters
+
+
+def collect_all_video_segments(root_draft: dict) -> list[tuple[dict, dict, dict, str]]:
+    """
+    Collect EVERY child video segment (`video con`) across all Compound Clips (`materials.drafts`)
+    AND any direct video segments on the root timeline (`root_draft.tracks`), in chronological order.
+    Returns list of tuples: (draft_obj, seg_obj, video_material_obj, container_label).
+    """
+    collected = []
+    visited_drafts = set()
+
+    def _scan_draft(d_obj: dict, label: str):
+        vids = {v["id"]: v for v in d_obj.get("materials", {}).get("videos", [])}
+        nested_drafts = {nd["id"]: nd for nd in d_obj.get("materials", {}).get("drafts", []) if "draft" in nd}
+        for trk_idx, trk in enumerate(d_obj.get("tracks", [])):
+            if trk.get("type", "video") != "video":
+                continue
+            for seg in trk.get("segments", []):
+                mid = seg.get("material_id", "")
+                refs = [mid] + list(seg.get("extra_material_refs", []))
+                matched_nd_id = next((r for r in refs if r in nested_drafts), None)
+                if matched_nd_id:
+                    visited_drafts.add(matched_nd_id)
+                    nd = nested_drafts[matched_nd_id]
+                    _scan_draft(nd["draft"], f"{label}/Compound[{nd.get('name') or matched_nd_id[:6]}]")
+                elif mid in vids and vids[mid].get("path"):
+                    collected.append((d_obj, seg, vids[mid], f"{label}:T{trk_idx}"))
+
+    _scan_draft(root_draft, "Root")
+    for i, sd in enumerate(root_draft.get("materials", {}).get("drafts", [])):
+        if "draft" in sd and sd.get("id") not in visited_drafts:
+            _scan_draft(sd["draft"], f"Compound[{i}]")
+
+    return collected
+
+
+def resolve_project_dir(project_arg: str) -> str:
+    if os.path.isdir(project_arg):
+        return os.path.abspath(project_arg)
+    candidate = os.path.join(CAPCUT_PROJECTS_ROOT, project_arg)
+    if os.path.isdir(candidate):
+        return candidate
+    raise FileNotFoundError(f"CapCut project not found: {project_arg}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run segment-level source_timerange diagnostics & Ground-Truth scene mapping.")
+    parser.add_argument("project", help="Project ID (e.g. 1030, '1026 - THU SKILL MOI') or full path.")
+    parser.add_argument("--out", default="", help="Optional output JSON path to save segment diagnostics.")
+    args = parser.parse_args()
+
+    proj_dir = resolve_project_dir(args.project)
+    root_path = os.path.join(proj_dir, "draft_info.json")
+    with open(root_path, "r", encoding="utf-8") as f:
+        root_draft = json.load(f)
+
+    all_seg_tuples = collect_all_video_segments(root_draft)
+    video_paths = list({v.get("path", "") for _, _, v, _ in all_seg_tuples if v.get("path")})
+    clip_bg_map, gt_path = discover_ground_truth_scene_map(video_paths)
+    if gt_path:
+        print(f"Found Ground-Truth Scene Map: {gt_path} ({len(clip_bg_map)} clips mapped to BG locations)")
+    else:
+        print("WARNING: No *BANGTRA*.txt / sf-board.json found in video folders — using Visual Fallback clustering (confirm with user!).")
+
+    print(f"Project '{os.path.basename(proj_dir)}': Measuring {len(all_seg_tuples)} child video segments (video con) at exact source_timerange...")
+    seg_records = []
+    cache_by_range = {}
+    for idx, (_, seg, v, container_lbl) in enumerate(all_seg_tuples):
+        vpath = v.get("path", "")
+        mname = v.get("material_name") or os.path.basename(vpath)
+        st_sec = seg.get("source_timerange", {}).get("start", 0) / 1e6
+        dur_sec = seg.get("source_timerange", {}).get("duration", 5000000) / 1e6
+        cache_key = (vpath, round(st_sec, 1), round(dur_sec, 1))
+        if cache_key not in cache_by_range and os.path.exists(vpath):
+            cache_by_range[cache_key] = extract_segment_metrics(vpath, st_sec, dur_sec)
+        m = cache_by_range.get(cache_key, {})
+        seg_records.append({
+            "seg_idx": idx,
+            "seg_id": seg.get("id", ""),
+            "container": container_lbl,
+            "material_name": mname,
+            "start_sec": round(st_sec, 2),
+            "dur_sec": round(dur_sec, 2),
+            "metrics": m,
+        })
+
+    vals = [r["metrics"] for r in seg_records if r["metrics"]]
+    if vals:
+        print("\n=== EMPIRICAL SEGMENT METRICS SUMMARY (Medians & P10..P90) ===")
+        for k in ["p5", "p25", "mid", "p95", "contrast", "rb", "gm", "sat", "hsv_s", "sharp", "hf_noise"]:
+            arr = [x[k] for x in vals]
+            print(f"  {k:10s}: median={np.median(arr):+.4f} | p10={np.percentile(arr, 10):+.3f} .. p90={np.percentile(arr, 90):+.3f}")
+
+    clusters = cluster_timeline_scenes(seg_records, clip_bg_map)
+    print(f"\n=== SCENE CLUSTERS ({len(clusters)} scenes, Mode={clusters[0]['source_mode'] if clusters else 'NONE'}) ===")
+    angle_jumps = []
+    for c in clusters:
+        a = c["anchor"]
+        print(
+            f"  Scene[{c['cluster_id']:2d}] ({c['bg_code']:8s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
+            f"Anchor: P5={a['p5']:.3f} Mid={a['mid']:.3f} R-B={a['rb']:+.3f} G-M={a['gm']:+.3f} Sat={a['sat']:.3f}"
+        )
+        for s_idx in c["seg_indices"]:
+            r = seg_records[s_idx]
+            m = r["metrics"]
+            if not m:
+                continue
+            d_rb = m["rb"] - a["rb"]
+            d_mid = m["mid"] - a["mid"]
+            if "(" in r["material_name"] or "_" in r["material_name"] or abs(d_rb) > 0.042 or abs(d_mid) > 0.060:
+                angle_jumps.append((s_idx, c["cluster_id"], c["bg_code"], r["material_name"], r["start_sec"], round(d_rb, 3), round(d_mid, 3), m["mid"], m["rb"]))
+
+    if angle_jumps:
+        print(f"\n=== DETECTED INTRA-SCENE CAMERA ANGLE JUMPS / VARIANT SEGMENTS ({len(angle_jumps)} segments) ===")
+        for s_idx, cid, bgc, mname, st_s, d_rb, d_mid, mid_v, rb_v in angle_jumps[:25]:
+            print(
+                f"  Seg[{s_idx:3d}] (Scene {cid:2d} {bgc}) {mname:14s} @{st_s:5.1f}s | "
+                f"Mid={mid_v:.3f} (dMid={d_mid:+.3f}) | R-B={rb_v:+.3f} (dRB={d_rb:+.3f})"
+            )
+
+    if args.out:
+        payload = {
+            "ground_truth_source": gt_path,
+            "clip_bg_map": {str(k): v for k, v in clip_bg_map.items()},
+            "segments": seg_records,
+        }
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nSaved {len(seg_records)} segment-level diagnostics to {args.out}")
+        print("REMINDER: Ask the user (1) Model Source / Outlier confirmation and (2) Emotional Direction before running apply_grade.py!")
+
+
+if __name__ == "__main__":
+    main()
