@@ -28,12 +28,16 @@ DEFAULT_EFFECT_CACHE = "/Users/daho100/Library/Containers/com.lemon.lvoverseas/D
 OPTICAL_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", "lut_optical_db.json")
 
 
-def load_optical_db(lut_map: dict) -> list[dict]:
+def load_optical_db(lut_map: dict, allowed_tiers: tuple[str, ...] = ("cinema_rec709",)) -> list[dict]:
     if not os.path.exists(OPTICAL_DB_PATH):
         return []
     with open(OPTICAL_DB_PATH, "r", encoding="utf-8") as f:
         db = json.load(f)
-    return [entry for entry in db if entry.get("title") in lut_map]
+    return [
+        entry for entry in db
+        if entry.get("title") in lut_map
+        and (not allowed_tiers or entry.get("tier", "cinema_rec709") in allowed_tiers)
+    ]
 
 VERSION_MAP = {
     "lut": "",
