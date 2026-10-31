@@ -12,7 +12,7 @@
    - **Angle-Adaptive Sibling LUT Counter-Balancing**: Respects CapCut's shader order (`AmazingFilter_lut` at `zorder: 2000` runs before `AmazingFeature_adjustColor` at `zorder: 8004`) so camera angles that jump in exposure/color temperature switch to a counter-balance sibling LUT and converge to the exact same Scene Target.
    - **Full Per-Child-Video (`video con`) Adjust Stack**: Every child video inside every Compound Clip (`subdraft`) and on the root timeline receives its own LUT + 11–12 tailored Adjust sliders.
 2. **[`capcut-draft-tech`](skills/capcut-draft-tech/SKILL.md)** *(Technical Execution & CapCut JSON Sync Engine)*:
-   - Bundles the 12 core 35mm `.cube` LUTs in `skills/capcut-draft-tech/resources/luts/` and auto-registers them in `LutImportCfg.json`.
+   - Bundles all **508 Cinema-Safe Rec.709 `.cube` LUTs** directly in [`skills/capcut-draft-tech/resources/luts/`](skills/capcut-draft-tech/resources/luts) along with their measured 3D optical transfer database [`lut_optical_db.json`](skills/capcut-draft-tech/resources/lut_optical_db.json) and auto-registers them in `LutImportCfg.json`.
    - Extracts 16 `ffmpeg` + `numpy` metrics per timeline segment (`source_timerange`).
    - Safely syncs `draft_info.json`, `draft_info.json.bak`, `template-2.tmp`, `Timelines/*`, and `subdraft/*/draft_content.json`.
 
