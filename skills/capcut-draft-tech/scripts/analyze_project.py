@@ -127,17 +127,30 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
             try:
                 data = json.load(open(sfb, "r", encoding="utf-8"))
                 clip_map = {}
+                # Identify sub-variants in scenes[0].sfs that represent distinct time-of-day (night/evening)
+                distinct_variants = set()
+                if data.get("scenes"):
+                    for ref_sf in data["scenes"][0].get("sfs", []):
+                        rid = ref_sf.get("id", "")
+                        rdesc = (ref_sf.get("name") or ref_sf.get("title") or ref_sf.get("desc") or "").lower()
+                        if re.match(r"^(BG|IMG)\d+[b-z]$", rid, re.IGNORECASE):
+                            if any(kw in rdesc for kw in ("đêm", "tối", "night", "evening", "dusk", "veranda", "ngoài")):
+                                distinct_variants.add(rid.upper())
+
                 for sc in data.get("scenes", []):
                     sc_id = sc.get("id", "")
-                    sc_title = sc.get("name") or sc.get("title") or sc_id
-                    for sf in sc.get("sfs", []):
+                    for sf in list(sc.get("sfs", [])) + list(sc.get("shots", [])):
                         cid = sf.get("id", "")
-                        m = re.search(r"V-(\d+)", cid)
+                        m = re.search(r"V-(\d+)", cid, re.IGNORECASE)
                         if m:
                             cnum = int(m.group(1))
-                            bgs = sf.get("refs", {}).get("bgs", [])
-                            base_bg = re.sub(r"[a-z]$", "", bgs[0]) if bgs else sc_id
-                            clip_map[cnum] = f"{base_bg}:{sc_title[:30]}"
+                            raw_bg = sf.get("sf") or ((sf.get("refs") or {}).get("bgs") or [""])[0]
+                            raw_bg_up = raw_bg.upper()
+                            if raw_bg_up in distinct_variants:
+                                base_bg = raw_bg_up
+                            else:
+                                base_bg = re.sub(r"[A-Z]$", "", raw_bg_up) if raw_bg_up else sc_id
+                            clip_map[cnum] = f"{sc_id}:{base_bg}"
                 if clip_map:
                     return clip_map, sfb
             except Exception:
@@ -227,10 +240,10 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None) -> list
         raw_bgs = []
         for idx_r, r in enumerate(seg_records):
             mname = r["material_name"]
-            if idx_r == 0 and (mname.startswith("ord_") or r.get("dur_sec", 0) >= 20.0):
+            cnum = extract_clip_number(mname)
+            if idx_r == 0 and (mname.startswith("ord_") or (cnum == -1 and r.get("dur_sec", 0) >= 20.0)):
                 raw_bgs.append("SEEDANCE_HOOK:BG1")
                 continue
-            cnum = extract_clip_number(mname)
             raw_bgs.append(clip_bg_map.get(cnum, ""))
 
         # Fill empty/transition clips from nearest known BG

@@ -278,6 +278,8 @@ def match_optimal_lut_by_video_simulation(
         t_up = t.upper()
         if not any(t_up.startswith(pfx) for pfx in cinematic_safe_prefixes):
             continue
+        if any(bad in t_up for bad in ("VINTAGE", "RETRO", "SEPIA", "OLD", "BW", "B&W", "MONO")):
+            continue
         fam_bonus = -0.020 if any(k in t_up for k in preferred_families) else 0.0
 
         for alpha in candidate_alphas:
@@ -459,6 +461,10 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
         base_loc = bg_code.split(":")[-1] if ":" in bg_code else bg_code
         if bg_code.startswith("SEEDANCE_HOOK"):
             regime = "SEEDANCE_HOOK"
+        elif base_loc.startswith("IMG"):
+            # In sf-board.json projects, distinct time-of-day variants already have distinct base_loc (e.g. IMG6 vs IMG6B, IMG10 vs IMG10B).
+            # Grouping strictly by base_loc guarantees 100% of scenes in the same room (e.g. S1, S15, S19..S23 in IMG1) share one unified target & LUT!
+            regime = "SFB_LOC"
         elif bg_code == "E0:BG1" or "NIGHT" in bg_code or "NIGH" in bg_code or (a["mid"] <= 0.265 and a["rb"] <= 0.025) or (a["rb"] <= -0.012 and a["mid"] <= 0.335):
             regime = "DARK_STORM_NIGHT"
             base_loc = "NIGHT_EXT"
@@ -814,7 +820,7 @@ def make_mini_draft_effect(eff: dict) -> dict:
 
 def build_mini_draft_adjust(seg: dict, effects_by_id: dict, existing_adjust: dict = None) -> dict:
     base = {
-        "adjust_mask": None,
+        "adjust_mask": existing_adjust.get("adjust_mask") if isinstance(existing_adjust, dict) else None,
         "adjust_preset_resource_id": "",
         "backlight_correction": None,
         "black": None,
@@ -823,7 +829,7 @@ def build_mini_draft_adjust(seg: dict, effects_by_id: dict, existing_adjust: dic
         "color_adjust_pro": None,
         "color_correct": None,
         "color_correct_alg_result": "",
-        "color_curves": None,
+        "color_curves": existing_adjust.get("color_curves") if isinstance(existing_adjust, dict) else None,
         "color_dehaze": None,
         "color_levels": None,
         "color_match": None,
@@ -831,7 +837,7 @@ def build_mini_draft_adjust(seg: dict, effects_by_id: dict, existing_adjust: dic
         "color_temperature": None,
         "contrast": None,
         "enable_adjust": bool(seg.get("enable_adjust", False)),
-        "enable_adjust_mask": False,
+        "enable_adjust_mask": bool(existing_adjust.get("enable_adjust_mask", False)) if isinstance(existing_adjust, dict) else False,
         "enable_color_adjust_pro": False,
         "enable_color_correct_adjust": False,
         "enable_color_curves": True,
