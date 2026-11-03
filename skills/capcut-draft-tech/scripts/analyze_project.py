@@ -100,6 +100,19 @@ def extract_clip_number(mname: str) -> int:
     return -1
 
 
+def extract_clip_key(mname: str):
+    """
+    Extracts either an alphanumeric SF Board shot ID (e.g. 'V-S1-02-B1' from 'V-S1-02-B1_v1.mp4')
+    or an integer clip number (e.g. 1 from 'V-001.mp4' / '001.mp4').
+    """
+    base = os.path.splitext(os.path.basename(mname))[0]
+    base = re.sub(r"_v\d+$", "", base, flags=re.IGNORECASE)
+    m_vs = re.match(r"^(V-S\d+-[0-9A-Z-]+)$", base, re.IGNORECASE)
+    if m_vs:
+        return m_vs.group(1).upper()
+    return extract_clip_number(mname)
+
+
 def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
     """
     Searches the video folders and parent folders for ground-truth script files:
@@ -115,42 +128,65 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
         if not vp:
             continue
         cur = os.path.dirname(vp)
-        for _ in range(4):
-            if os.path.isdir(cur) and cur not in ("/", "/Users", "/Users/daho100"):
+        for _ in range(3):
+            if os.path.isdir(cur) and cur not in ("/", "/Users", "/Users/daho100", "/Users/daho100/Documents", "/Users/daho100/Long", "/Users/daho100/Documents/SF Board"):
                 search_dirs.add(cur)
             cur = os.path.dirname(cur)
 
+    ordered_dirs = sorted(search_dirs, key=lambda x: (-len(x), x))
+
     # 1. Check sf-board.json
-    for sdir in sorted(search_dirs):
+    for sdir in ordered_dirs:
         sfb = os.path.join(sdir, "sf-board.json")
         if os.path.exists(sfb):
             try:
                 data = json.load(open(sfb, "r", encoding="utf-8"))
                 clip_map = {}
-                # Identify sub-variants in scenes[0].sfs that represent distinct time-of-day (night/evening)
                 distinct_variants = set()
-                if data.get("scenes"):
-                    for ref_sf in data["scenes"][0].get("sfs", []):
-                        rid = ref_sf.get("id", "")
-                        rdesc = (ref_sf.get("name") or ref_sf.get("title") or ref_sf.get("desc") or "").lower()
+                sf_lookup = {}
+                for sc in data.get("scenes", []):
+                    for sf in sc.get("sfs", []):
+                        rid = sf.get("id", "")
+                        if rid:
+                            sf_lookup[rid] = sf
+                        rdesc = (sf.get("name") or sf.get("title") or sf.get("desc") or "").lower()
                         if re.match(r"^(BG|IMG)\d+[b-z]$", rid, re.IGNORECASE):
                             if any(kw in rdesc for kw in ("đêm", "tối", "night", "evening", "dusk", "veranda", "ngoài")):
                                 distinct_variants.add(rid.upper())
+
+                def _resolve_sfb_bg(raw_ref: str, sc_id: str) -> str:
+                    cur = raw_ref
+                    for _ in range(6):
+                        if not cur:
+                            break
+                        c_up = cur.upper()
+                        if c_up.startswith(("REF_BG_", "BG", "IMG")):
+                            if c_up.startswith("REF_BG_"):
+                                return c_up.replace("REF_BG_", "")
+                            if c_up in distinct_variants:
+                                return c_up
+                            return re.sub(r"[A-Z]$", "", c_up)
+                        node = sf_lookup.get(cur)
+                        if not node:
+                            break
+                        refs = node.get("refs") or {}
+                        nxt = refs.get("bg") or (refs.get("bgs") or [""])[0]
+                        if not nxt or nxt == cur:
+                            break
+                        cur = nxt
+                    return cur.upper() if cur else sc_id
 
                 for sc in data.get("scenes", []):
                     sc_id = sc.get("id", "")
                     for sf in list(sc.get("sfs", [])) + list(sc.get("shots", [])):
                         cid = sf.get("id", "")
-                        m = re.search(r"V-(\d+)", cid, re.IGNORECASE)
-                        if m:
-                            cnum = int(m.group(1))
-                            raw_bg = sf.get("sf") or ((sf.get("refs") or {}).get("bgs") or [""])[0]
-                            raw_bg_up = raw_bg.upper()
-                            if raw_bg_up in distinct_variants:
-                                base_bg = raw_bg_up
-                            else:
-                                base_bg = re.sub(r"[A-Z]$", "", raw_bg_up) if raw_bg_up else sc_id
-                            clip_map[cnum] = f"{sc_id}:{base_bg}"
+                        if not cid.upper().startswith("V-"):
+                            continue
+                        raw_bg = sf.get("sf") or (sf.get("refs") or {}).get("bg") or ((sf.get("refs") or {}).get("bgs") or [""])[0]
+                        base_bg = _resolve_sfb_bg(raw_bg, sc_id)
+                        ckey = extract_clip_key(cid)
+                        clip_map[ckey] = f"{sc_id}:{base_bg}"
+                        clip_map[str(ckey)] = f"{sc_id}:{base_bg}"
                 if clip_map:
                     return clip_map, sfb
             except Exception:
@@ -158,7 +194,7 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
 
     # 2. Check *BANGTRA*.txt or *PROMPT*.txt
     candidates = []
-    for sdir in sorted(search_dirs):
+    for sdir in ordered_dirs:
         candidates.extend(sorted(glob.glob(os.path.join(sdir, "*BANGTRA*.txt"))))
         candidates.extend(sorted(glob.glob(os.path.join(sdir, "*PROMPT*.txt"))))
 
@@ -240,11 +276,11 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None) -> list
         raw_bgs = []
         for idx_r, r in enumerate(seg_records):
             mname = r["material_name"]
-            cnum = extract_clip_number(mname)
-            if idx_r == 0 and (mname.startswith("ord_") or (cnum == -1 and r.get("dur_sec", 0) >= 20.0)):
+            ckey = extract_clip_key(mname)
+            if idx_r == 0 and (mname.startswith("ord_") or (ckey == -1 and r.get("dur_sec", 0) >= 20.0)):
                 raw_bgs.append("SEEDANCE_HOOK:BG1")
                 continue
-            raw_bgs.append(clip_bg_map.get(cnum, ""))
+            raw_bgs.append(clip_bg_map.get(ckey) or clip_bg_map.get(str(ckey), ""))
 
         # Fill empty/transition clips from nearest known BG
         for i in range(n):

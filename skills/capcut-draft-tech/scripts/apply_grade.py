@@ -9,6 +9,7 @@ import copy
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -286,11 +287,11 @@ def match_optimal_lut_by_video_simulation(
             sim = simulate_video_through_lut(video_m, entry, alpha)
             if not (sim["sim_p5"] < sim["sim_mid"] < sim["sim_hi"]):
                 continue
-            if sim["sim_p5"] < 0.012 or sim["sim_p5"] > 0.115:
+            if sim["sim_p5"] < 0.012 or sim["sim_p5"] > max(0.115, video_m.get("p5", 0.05) + 0.008):
                 continue
-            if sim["sim_hi"] > 0.88 or sim["sim_hi"] < 0.42:
+            if sim["sim_hi"] > max(0.88, video_m.get("p95", 0.62) + 0.008) or sim["sim_hi"] < 0.42:
                 continue
-            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > 0.245):
+            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > max(0.245, video_m.get("sat", 0.15) * 1.02)):
                 continue
 
             err_mid = abs(sim["sim_mid"] - target_mid) * 2.8
@@ -328,8 +329,7 @@ def select_scene_primary_lut_and_targets(
     is_dark_storm_or_night = (
         is_seedance_hook
         or bg_code == "E0:BG1"
-        or "NIGHT" in bg_code
-        or "NIGH" in bg_code
+        or (("NIGHT" in bg_code or "NIGH" in bg_code) and rb <= 0.045)
         or (mid <= 0.265 and rb <= 0.025)
         or (rb <= -0.012 and mid <= 0.335)
     )
@@ -444,6 +444,7 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
        Location Target and Primary LUT so returning to the same room/tarmac never jumps color!
     """
     total_segs = sum(len(c["seg_indices"]) for c in clusters) or 1
+    has_seedance_hook = any(c["bg_code"].startswith("SEEDANCE_HOOK") for c in clusters)
     seedance_ref = {
         "target_p5": 0.045,
         "target_mid": 0.312,
@@ -451,7 +452,7 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
         "target_rb": 0.020,
         "target_gm": -0.008,
         "target_sat": 0.108,
-    }
+    } if has_seedance_hook else None
 
     # First pass: group clusters by (LightingRegime, BaseLocation) to compute unified Location Anchors
     loc_groups = defaultdict(list)
@@ -461,9 +462,9 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
         base_loc = bg_code.split(":")[-1] if ":" in bg_code else bg_code
         if bg_code.startswith("SEEDANCE_HOOK"):
             regime = "SEEDANCE_HOOK"
-        elif base_loc.startswith("IMG"):
-            # In sf-board.json projects, distinct time-of-day variants already have distinct base_loc (e.g. IMG6 vs IMG6B, IMG10 vs IMG10B).
-            # Grouping strictly by base_loc guarantees 100% of scenes in the same room (e.g. S1, S15, S19..S23 in IMG1) share one unified target & LUT!
+        elif base_loc.startswith("IMG") or re.match(r"^S\d+:", bg_code):
+            # In sf-board.json projects, distinct time-of-day/location variants have distinct base_loc (e.g. IMG6 vs IMG6B, PRIVATE_DINING_NIGHT vs HEARING_ROOM_DAY).
+            # Grouping strictly by base_loc guarantees 100% of scenes in the same room share one unified target & LUT!
             regime = "SFB_LOC"
         elif bg_code == "E0:BG1" or "NIGHT" in bg_code or "NIGH" in bg_code or (a["mid"] <= 0.265 and a["rb"] <= 0.025) or (a["rb"] <= -0.012 and a["mid"] <= 0.335):
             regime = "DARK_STORM_NIGHT"
@@ -570,61 +571,58 @@ def compute_shot_lut_and_adjustments(
     else:
         sim = {"sim_p5": p5, "sim_mid": mid, "sim_hi": p95, "sim_contrast": c, "sim_rb": rb, "sim_gm": gm, "sim_sat": sat}
 
-    nb_mid_diff = mid - local_neighbor_m.get("mid", mid)
-    nb_rb_diff = rb - local_neighbor_m.get("rb", rb)
-    nb_sat_diff = sat - local_neighbor_m.get("sat", sat)
-    nb_weight = 0.45 if force_neighbor_match else 0.22
+    outlier_boost = 1.18 if force_neighbor_match else 1.0
 
     adjust = []
 
     # Stage 2 (zorder 8004) — Closed-Loop Residual-Canceling 12-Slider Adjust Stack per Child Video:
-    # 1. SHADOW (`shadow`, v3) — Open dark shadows cleanly (`+0.02..+0.14`), gently anchor milky blacks (`-0.08..0`)
+    # 1. SHADOW (`shadow`, v3) — Open dark shadows cleanly (`+0.02..+0.15`), gently anchor milky blacks (`-0.09..0`)
     res_p5 = sim["sim_p5"] - target_p5
     if res_p5 > 0:
-        raw_shd = -res_p5 * 1.25
+        raw_shd = -res_p5 * 1.25 * outlier_boost
     else:
-        raw_shd = -res_p5 * 2.20 + max(0.0, 0.155 - p25) * 0.45
+        raw_shd = -res_p5 * 2.20 * outlier_boost + max(0.0, 0.155 - p25) * 0.45
     shadow_val = non_zero_clamp(raw_shd, -0.09, 0.15, min_abs=0.01, default_sign=1.0)
     adjust.append(("shadow", shadow_val))
 
-    # 2. HIGHLIGHT (`highlight`, v3) — Keep highlights airy and luminous (only pull down if hot > 0.78)
+    # 2. HIGHLIGHT (`highlight`, v3) — Keep highlights airy and luminous; strongly recover blown Grok highlights (> 0.78)
     res_hi = sim["sim_hi"] - target_hi
-    raw_hl = -res_hi * 0.55 - max(0.0, p99 - 0.860) * 0.25
-    highlight_val = non_zero_clamp(raw_hl, -0.10, 0.10, min_abs=0.01, default_sign=1.0 if res_hi <= 0 else -1.0)
+    raw_hl = -res_hi * 0.85 * outlier_boost - max(0.0, p99 - 0.850) * 0.35
+    highlight_val = non_zero_clamp(raw_hl, -0.18, 0.10, min_abs=0.01, default_sign=1.0 if res_hi <= 0 else -1.0)
     adjust.append(("highlight", highlight_val))
 
     # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "") — Pull Post-LUT `sim_mid` to `target_mid`
     res_mid = sim["sim_mid"] - target_mid
-    raw_br = -res_mid * 0.95 - nb_mid_diff * nb_weight
-    bright_val = non_zero_clamp(raw_br, -0.11, 0.16, min_abs=0.01, default_sign=1.0 if res_mid <= 0 else -1.0)
+    raw_br = -res_mid * 1.20 * outlier_boost
+    bright_val = non_zero_clamp(raw_br, -0.18, 0.18, min_abs=0.01, default_sign=1.0 if res_mid <= 0 else -1.0)
     adjust.append(("brightness", bright_val))
 
-    raw_ls = -res_mid * 0.30 - nb_mid_diff * 0.12
-    light_sens_val = non_zero_clamp(raw_ls, -0.03, 0.05, min_abs=0.01, default_sign=1.0 if res_mid <= 0 else -1.0)
+    raw_ls = -res_mid * 0.36 * outlier_boost
+    light_sens_val = non_zero_clamp(raw_ls, -0.06, 0.06, min_abs=0.01, default_sign=1.0 if res_mid <= 0 else -1.0)
     adjust.append(("light_sensation", light_sens_val))
 
-    # 4. CONTRAST (`contrast`, v3) — Smooth, gentle 35mm contrast (never harsh or gloomy)
+    # 4. CONTRAST (`contrast`, v3) — Smooth, gentle 35mm contrast (tames harsh plastic Grok contrast > 0.70)
     target_c = target_hi - target_p5
-    raw_con = (target_c - sim["sim_contrast"]) * 0.28
-    contrast_val = non_zero_clamp(raw_con, -0.04, 0.04, min_abs=0.01, default_sign=-1.0)
+    raw_con = (target_c - sim["sim_contrast"]) * 0.45
+    contrast_val = non_zero_clamp(raw_con, -0.10, 0.04, min_abs=0.01, default_sign=-1.0)
     adjust.append(("contrast", contrast_val))
 
-    # 5. TONE / TINT (`tone`, v3) — Gentle skintone neutralization (prevent heavy magenta/green cast)
+    # 5. TONE / TINT (`tone`, v3) — Skintone neutralization (cancels heavy Grok magenta/purple skin cast)
     res_gm = sim["sim_gm"] - target_gm
-    raw_tone = res_gm * 2.2
-    tone_val = non_zero_clamp(raw_tone, -0.05, 0.06, min_abs=0.01, default_sign=1.0)
+    raw_tone = res_gm * 2.5 * outlier_boost
+    tone_val = non_zero_clamp(raw_tone, -0.10, 0.08, min_abs=0.01, default_sign=1.0)
     adjust.append(("tone", tone_val))
 
-    # 6. TEMPERATURE (`temperature`, v3) — Pull Post-LUT `sim_rb` directly to `target_rb`
+    # 6. TEMPERATURE (`temperature`, v3) — Pull Post-LUT `sim_rb` directly to `target_rb` (neutralizes adjacent-clip RB swings)
     res_rb = sim["sim_rb"] - target_rb
-    raw_temp = -res_rb * 1.45 - nb_rb_diff * nb_weight
-    temp_val = non_zero_clamp(raw_temp, -0.16, 0.16, min_abs=0.01, default_sign=1.0 if res_rb <= 0 else -1.0)
+    raw_temp = -res_rb * 1.75 * outlier_boost
+    temp_val = non_zero_clamp(raw_temp, -0.24, 0.24, min_abs=0.01, default_sign=1.0 if res_rb <= 0 else -1.0)
     adjust.append(("temperature", temp_val))
 
-    # 7. SATURATION (`saturation`, v1) — Natural, clean 35mm chroma (never overly dense / "đậm đậm")
+    # 7. SATURATION (`saturation`, v1) — Natural, clean 35mm chroma (tames radioactive/neon Grok oversaturation)
     res_sat = sim["sim_sat"] - target_sat
-    raw_sat = -res_sat * 1.15 - nb_sat_diff * (nb_weight * 0.5)
-    sat_val = non_zero_clamp(raw_sat, -0.10, 0.08, min_abs=0.01, default_sign=-1.0 if res_sat > 0 else 1.0)
+    raw_sat = -res_sat * 1.45 * outlier_boost
+    sat_val = non_zero_clamp(raw_sat, -0.20, 0.08, min_abs=0.01, default_sign=-1.0 if res_sat > 0 else 1.0)
     adjust.append(("saturation", sat_val))
 
     # 8. NATURAL 35MM OPTICAL SHARPNESS (`sharpen`, `clear`, `particle`) — Crisp without harsh digital haloes ("sắc sắc"):
@@ -984,7 +982,7 @@ def main():
         loaded = json.load(open(args.metrics, "r", encoding="utf-8"))
         if isinstance(loaded, dict):
             if not clip_bg_map:
-                clip_bg_map = {int(k): v for k, v in loaded.get("clip_bg_map", {}).items()}
+                clip_bg_map = {int(k) if str(k).isdigit() else k: v for k, v in loaded.get("clip_bg_map", {}).items()}
             for r in loaded.get("segments", []):
                 if r.get("metrics"):
                     preloaded_cache[(r.get("material_name", ""), round(float(r.get("start_sec", 0)), 1), round(float(r.get("dur_sec", 0)), 1))] = r["metrics"]
