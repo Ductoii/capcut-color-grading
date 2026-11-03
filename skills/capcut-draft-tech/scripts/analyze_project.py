@@ -51,7 +51,8 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         return {
             "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.26, "p50": 0.25, "p75": 0.38, "p95": 0.60, "p99": 0.74,
             "contrast": 0.55, "iqr_ratio": 0.44, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
-            "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "sharp": 0.040, "hf_noise": 0.028
+            "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "sharp": 0.040, "hf_noise": 0.028,
+            "skin_rb": 0.16, "skin_sat": 0.18, "skin_hi": 0.48
         }
 
     per_frame = []
@@ -72,6 +73,15 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         chroma = cmax - cmin
         sat = float(np.mean(chroma))
         hsv_s = float(np.mean(chroma / np.maximum(cmax, 1e-4)))
+        skin_mask = (r > g) & (g > b) & ((r - b) > 0.065) & (luma > 0.15) & (luma < 0.90)
+        if np.sum(skin_mask) >= 15:
+            skin_rb = float(np.mean((r - b)[skin_mask]))
+            skin_sat = float(np.mean(chroma[skin_mask]))
+            skin_hi = float(np.percentile(luma[skin_mask], 88))
+        else:
+            skin_rb = max(rb, hi_rb)
+            skin_sat = sat
+            skin_hi = float(p95)
         gx = np.abs(np.diff(luma, axis=1)).mean()
         gy = np.abs(np.diff(luma, axis=0)).mean()
         sharp = float(0.5 * (gx + gy))
@@ -80,7 +90,8 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         per_frame.append({
             "p1": p1, "p5": p5, "p25": p25, "mid": mid, "p50": p50, "p75": p75, "p95": p95, "p99": p99,
             "contrast": contrast, "iqr_ratio": iqr_ratio, "rb": rb, "shd_rb": shd_rb, "mid_rb": mid_rb,
-            "hi_rb": hi_rb, "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise
+            "hi_rb": hi_rb, "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise,
+            "skin_rb": skin_rb, "skin_sat": skin_sat, "skin_hi": skin_hi
         })
 
     keys = per_frame[0].keys()
