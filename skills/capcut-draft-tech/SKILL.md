@@ -81,7 +81,10 @@ CapCut's `7501974767453474064` (`lumi_hub_path` / `DefaultAdjustBundle`) color e
 2. **Sync All 6 Root & Timeline Files Identically**:
    - `draft_info.json`, `draft_info.json.bak`, `template-2.tmp`
    - `Timelines/<TIMELINE_UUID>/draft_info.json`, `draft_info.json.bak`, `template-2.tmp` *(never touch `template.tmp`)*.
-3. **Sync Compound Clip (`subdraft`)**:
-   - Copy `root_draft["materials"]["drafts"][0]["draft"]` into the matching `subdraft/<SUBDRAFT_UUID>/draft_content.json` (`sub_d["materials"]["drafts"][0]["draft"]`).
+3. **Sync Compound Clip (`subdraft`) & `mini_draft.json`**:
+   - Copy `root_draft["materials"]["drafts"][i]["draft"]` into every matching `subdraft/<SUBDRAFT_UUID>/draft_content.json` AND sync `adjust` dictionaries across `Timelines/<TIMELINE_UUID>/attachment/patch/mini_draft.json` (`segments` and `material_drafts[].segments`).
 4. **Reset Patch Queue**:
    - Write `{"patch_data":[]}` to `Timelines/<TIMELINE_UUID>/attachment/patch/patch.json`.
+5. **Promote Active Project LUTs into `LutImportCfg.json[0:100]` (`index <= 99`)**:
+   - CapCut's C++ engine (`ImportLUTDataManager::loadImportedLutList` at `0xbc7d028: cmp x8, #0x63; b.hi` and `VELutSpinComboBoxViewModel::createPopupItems` at `0x5830484: cmp w27, #0x63; b.gt` in `libVECreator.dylib`) hardcodes a strict **100-LUT limit (`index 0..99`)** when loading `LutImportCfg.json` into memory and the UI dropdown. Any LUT at `index >= 100` displays as `"None"` in CapCut's `Adjustment -> LUT` dropdown.
+   - `apply_grade.py` automatically promotes all LUTs used in the current project (`index 0..K-1`) and other active projects (`index K..99`, deduplicated by `os.path.basename(path)`) to the top of `LutImportCfg.json` before relaunching CapCut.

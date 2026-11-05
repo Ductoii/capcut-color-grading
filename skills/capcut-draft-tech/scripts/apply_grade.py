@@ -99,6 +99,97 @@ def load_lut_map() -> dict:
     return lut_map
 
 
+def promote_active_luts_in_cfg(active_lut_titles: list[str], proj_dir: str) -> list[int]:
+    """
+    CapCut's C++ engine (`ImportLUTDataManager::loadImportedLutList` at `0xbc7d028: cmp x8, #0x63; b.hi`
+    and `VELutSpinComboBoxViewModel::createPopupItems` at `0x5830484: cmp w27, #0x63; b.gt` in `libVECreator.dylib`)
+    hardcodes a strict 100-item limit (`index 0..99`) when loading `LutImportCfg.json` into memory and the UI dropdown!
+    Any LUT at index >= 100 displays as "None" in CapCut's Adjustment -> LUT dropdown.
+    Furthermore, `VELutSpinComboBoxViewModel` keys its lookup map (`m_pathToTitleMap`) by `QFileInfo(path).fileName()`.
+    This function promotes:
+      1. All LUTs used in the current project (`active_lut_titles`) to `index 0..K-1`,
+      2. All LUTs currently used across other CapCut drafts in `com.lveditor.draft` to `index K..M-1`,
+      3. Bundled core LUTs to the remaining slots of the top 100 (deduplicated by `os.path.basename(path)`),
+      4. All remaining library LUTs at `index 100+` so the optical simulator retains full access to all 1,636 LUTs.
+    """
+    if not os.path.exists(LUT_CFG_PATH):
+        return []
+    with open(LUT_CFG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, list) or not cfg:
+        return []
+
+    by_title = {}
+    for item in cfg:
+        t = item.get("title")
+        if t and t not in by_title and os.path.exists(item.get("path", "")):
+            by_title[t] = item
+
+    other_used = set()
+    drafts_root = os.path.dirname(os.path.abspath(proj_dir))
+    for d_path in sorted(glob.glob(os.path.join(drafts_root, "*", "draft_info.json"))):
+        if os.path.abspath(os.path.dirname(d_path)) == os.path.abspath(proj_dir):
+            continue
+        try:
+            with open(d_path, "r", encoding="utf-8") as df:
+                d_obj = json.load(df)
+            for e in d_obj.get("materials", {}).get("effects", []):
+                if e.get("type") == "lut" and e.get("name") in by_title:
+                    other_used.add(e["name"])
+            for sd in d_obj.get("materials", {}).get("drafts", []):
+                for e in sd.get("draft", {}).get("materials", {}).get("effects", []):
+                    if e.get("type") == "lut" and e.get("name") in by_title:
+                        other_used.add(e["name"])
+        except Exception:
+            pass
+
+    top_items = []
+    used_titles = set()
+    used_basenames = set()
+
+    def try_add_top(title: str):
+        if title in used_titles or title not in by_title:
+            return
+        item = by_title[title]
+        bname = os.path.basename(item.get("path", ""))
+        if len(top_items) < 100 and bname in used_basenames:
+            return
+        top_items.append(item)
+        used_titles.add(title)
+        used_basenames.add(bname)
+
+    # 1. Current project LUTs ALWAYS get top priority (index 0..K-1)
+    for t in sorted(set(active_lut_titles)):
+        if t in by_title:
+            item = by_title[t]
+            top_items.append(item)
+            used_titles.add(t)
+            used_basenames.add(os.path.basename(item.get("path", "")))
+
+    # 2. Other active projects' LUTs next (guaranteed within top 100)
+    for t in sorted(other_used):
+        try_add_top(t)
+
+    # 3. Fill remaining top-100 slots with unique-basename items
+    for item in cfg:
+        if len(top_items) >= 100:
+            break
+        t = item.get("title")
+        if t:
+            try_add_top(t)
+
+    # 4. Append all remaining items after index 100 so no LUT is ever lost
+    tail_items = [item for item in cfg if item.get("title") not in used_titles]
+    new_cfg = top_items + tail_items
+
+    with open(LUT_CFG_PATH, "w", encoding="utf-8") as f:
+        json.dump(new_cfg, f, ensure_ascii=False, indent=4)
+
+    title_to_idx = {item.get("title"): idx for idx, item in enumerate(new_cfg)}
+    return [title_to_idx.get(t, -1) for t in sorted(set(active_lut_titles))]
+
+
+
 def make_effect(eff_type: str, value: float, lut_map: dict, effect_cache: str, lut_title: str = "", version: str = None, skin_corr: bool = False) -> dict:
     if eff_type == "lut":
         assert lut_title in lut_map, f"LUT not found in LutImportCfg.json: {lut_title}"
@@ -1150,7 +1241,10 @@ def main():
         seg["enable_adjust"] = True
         summary.append((idx, c_info["cluster_id"], mname, lut_title, val, prof, len(adj_list)))
 
-    # 3. Write synced files (Root + Timelines + mini_draft.json + ALL Subdraft Compound Clips)
+    # 3. Promote active project LUTs into LutImportCfg.json[0:100] (index <= 99) so CapCut UI ComboBox never shows "None"
+    promoted_indices = promote_active_luts_in_cfg([s[3] for s in summary], proj_dir)
+
+    # 4. Write synced files (Root + Timelines + mini_draft.json + ALL Subdraft Compound Clips)
     root_json_str = json.dumps(root_draft, ensure_ascii=False, separators=(",", ":"))
     sync_targets = ["draft_info.json", "draft_info.json.bak", "template-2.tmp"]
     for tl_dir in glob.glob(os.path.join(proj_dir, "Timelines", "*")):
@@ -1189,7 +1283,7 @@ def main():
     mode_str = clusters[0]["source_mode"] if clusters else "NONE"
     print(
         f"Graded {len(summary)} child video segments (video con) across {len(clusters)} Scene Clusters ({mode_str}) in '{os.path.basename(proj_dir)}' "
-        f"[Emotion: {args.emotion} | {angle_jump_fixes} Angle-Jump Sibling LUT fixes | {zoomed_count} Zoomed (~150%) Super-Res Boosts | {total_adjusts} per-video Adjust sliders ({total_adjusts/max(len(summary),1):.1f} sliders/video)]"
+        f"[Emotion: {args.emotion} | {angle_jump_fixes} Angle-Jump Sibling LUT fixes | {zoomed_count} Zoomed (~150%) Super-Res Boosts | {total_adjusts} per-video Adjust sliders ({total_adjusts/max(len(summary),1):.1f} sliders/video) | LutImportCfg top-100 indices: {promoted_indices}]"
     )
     for c in clusters:
         cfg = c["scene_cfg"]
