@@ -384,24 +384,26 @@ def select_scene_primary_lut_and_targets(
         else:
             act_mood = emotion
 
-        target_p5 = 0.046
-        target_hi = 0.595
-        if mid <= 0.285:
-            # Evening/night/dark-suit interior scenes: keep target_mid grounded (0.255..0.275) so faces & windows never glare!
-            target_mid = clamp(mid, 0.255, 0.275)
+        target_p5 = 0.048
+        target_hi = 0.610
+        if mid <= 0.220:
+            target_mid = 0.255
+        elif mid <= 0.285:
+            # Evening/night/dark-suit interior scenes: keep target_mid grounded (0.260..0.280) so faces & windows never glare!
+            target_mid = clamp(mid, 0.260, 0.280)
         else:
-            # Daytime scenes: pull down glaring high-key midtones to a soft 35mm matte range (0.285..0.320)
-            target_mid = clamp(mid, 0.285, 0.320)
+            # Daytime scenes: pull down glaring high-key midtones to a soft 35mm matte range (0.290..0.325)
+            target_mid = clamp(mid, 0.290, 0.325)
 
         if rb > 0.155 and act_mood != "vintage-35mm":
             target_rb = 0.120
         elif rb < 0.090 and act_mood in ("warm-human", "vintage-35mm"):
             target_rb = 0.090
         else:
-            target_rb = clamp(rb, 0.050, 0.120)
+            target_rb = clamp(rb, 0.045, 0.120)
 
         target_gm = -0.010 if act_mood in ("warm-human", "vintage-35mm") else -0.008
-        target_sat = clamp(sat * 0.85, 0.095, 0.122)
+        target_sat = clamp(sat * 0.94, 0.095, 0.125)
         use_vignette = False
 
         if act_mood == "warm-human":
@@ -541,13 +543,14 @@ def compute_shot_lut_and_adjustments(
     skin_sat = m.get("skin_sat", sat)
     skin_hi = m.get("skin_hi", p95)
 
-    # Skin-Aware effective metrics so blue windows / gray suits NEVER mask radioactive orange/glaring Grok skin!
-    eff_in_rb = max(rb, skin_rb - 0.075)
-    eff_in_sat = max(sat, skin_sat - 0.050)
+    # Skin-Aware effective metrics so blue windows / gray suits NEVER mask radioactive orange/glaring skin!
+    is_plastic_or_hot = (c > 0.66 or sat > 0.165 or skin_sat > 0.235 or skin_rb > 0.235 or p95 > 0.72)
+    eff_in_rb = max(rb, skin_rb - 0.075) if is_plastic_or_hot else max(rb, 0.65 * rb + 0.35 * (skin_rb - 0.075))
+    eff_in_sat = max(sat, skin_sat - 0.050) if is_plastic_or_hot else max(sat, 0.60 * sat + 0.40 * (skin_sat - 0.050))
 
-    target_p5 = scene_cfg.get("target_p5", 0.046)
+    target_p5 = scene_cfg.get("target_p5", 0.048)
     target_mid = scene_cfg["target_mid"]
-    target_hi = scene_cfg.get("target_hi", 0.595)
+    target_hi = scene_cfg.get("target_hi", 0.610)
     target_rb = scene_cfg["target_rb"]
     target_gm = scene_cfg["target_gm"]
     target_sat = scene_cfg["target_sat"]
@@ -564,8 +567,8 @@ def compute_shot_lut_and_adjustments(
     eff_m = dict(m, rb=eff_in_rb, sat=eff_in_sat)
 
     # Stage 1 (zorder 2000): Trigger Counter-Balance Sibling LUT whenever shot deviates from Scene Target
-    if abs(d_mid_target) > 0.035 or abs(d_rb_target) > 0.025 or abs(d_p5_target) > 0.024 or skin_rb > 0.22 or skin_sat > 0.22:
-        fb = "FILM LOOK (18).cube" if (d_rb_target > 0.025 or skin_rb > 0.22) else ("SCC-rec709 (27).cube" if d_mid_target < -0.035 else "DRONE (19).cube")
+    if abs(d_mid_target) > 0.038 or abs(d_rb_target) > 0.028 or abs(d_p5_target) > 0.025 or skin_rb > 0.235 or skin_sat > 0.235:
+        fb = "FILM LOOK (18).cube" if (d_rb_target > 0.028 or skin_rb > 0.235) else ("SCC-rec709 (27).cube" if d_mid_target < -0.038 else "DRONE (19).cube")
         lut_title, base_val, shot_state = match_optimal_lut_by_video_simulation(
             optical_db, eff_m, target_mid, target_rb, target_gm, target_sat,
             ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE", "FILM LOOK", "DRONE"),
@@ -586,71 +589,81 @@ def compute_shot_lut_and_adjustments(
 
     adjust = []
 
-    # Stage 2 (zorder 8004) — Matte 35mm Anti-Glare / Anti-Plastic 12-Slider Adjust Stack per Child Video:
-    # 1. SHADOW (`shadow`, v3) — Gently open crushed dark suits (`+0.01..+0.08`) or anchor milky blacks (`-0.08..0`)
+    # Stage 2 (zorder 8004) — Adaptive Matte 35mm Anti-Glare / Anti-Plastic 12-Slider Adjust Stack per Child Video:
+    # 1. SHADOW (`shadow`, v3) — Open crushed darks (`+0.01..+0.10`) or anchor milky blacks (`-0.08..0`)
     res_p5 = sim["sim_p5"] - target_p5
     if res_p5 > 0:
         raw_shd = -res_p5 * 1.25 * outlier_boost
     else:
-        raw_shd = -res_p5 * 1.65 * outlier_boost + max(0.0, 0.145 - p25) * 0.30
-    shadow_val = non_zero_clamp(raw_shd, -0.08, 0.08, min_abs=0.01, default_sign=1.0)
+        raw_shd = -res_p5 * 1.80 * outlier_boost + max(0.0, 0.145 - p25) * 0.35
+    shadow_val = non_zero_clamp(raw_shd, -0.08, 0.10, min_abs=0.01, default_sign=1.0)
     adjust.append(("shadow", shadow_val))
 
-    # 2. HIGHLIGHT (`highlight`, v3) — ALWAYS NEGATIVE (`-0.08..-0.18`) to roll off window/forehead glare ("chói") & plastic sheen!
-    eff_hi = max(sim["sim_hi"], skin_hi + 0.08)
-    raw_hl = -0.080 - max(0.0, eff_hi - 0.44) * 0.45 * outlier_boost - max(0.0, p99 - 0.58) * 0.35
-    highlight_val = non_zero_clamp(raw_hl, -0.18, -0.08, min_abs=0.01, default_sign=-1.0)
+    # 2. HIGHLIGHT (`highlight`, v3) — ALWAYS NEGATIVE (`-0.04..-0.18`) to roll off window/forehead glare ("chói") & plastic sheen!
+    eff_hi = max(sim["sim_hi"], skin_hi + (0.07 if is_plastic_or_hot else 0.02))
+    raw_hl = -0.045 - max(0.0, eff_hi - 0.46) * 0.42 * outlier_boost - max(0.0, p99 - 0.62) * 0.32
+    highlight_val = non_zero_clamp(raw_hl, -0.18, -0.04, min_abs=0.01, default_sign=-1.0)
     adjust.append(("highlight", highlight_val))
 
     # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "") — Anti-Glare Exposure Control:
     res_mid = sim["sim_mid"] - target_mid
-    raw_br = -res_mid * 0.95 * outlier_boost - max(0.0, p95 - 0.64) * 0.22
-    # If the frame already has bright skin/windows (`skin_hi >= 0.46` or `p95 >= 0.42` or `p99 >= 0.55`), never boost brightness (> -0.02);
-    # also don't over-darken dark-suit interiors (`mid <= 0.27` capped at `-0.05` min brightness so rooms stay clear!).
-    max_pos_br = -0.02 if (skin_hi >= 0.46 or p95 >= 0.42 or p99 >= 0.55) else 0.05
+    raw_br = -res_mid * 0.95 * outlier_boost - max(0.0, p95 - 0.65) * 0.20
+    if is_plastic_or_hot or p95 >= 0.60 or skin_hi >= 0.52:
+        max_pos_br = -0.01
+    elif mid < 0.23 and p95 < 0.56:
+        max_pos_br = 0.08
+    else:
+        max_pos_br = 0.03
     min_neg_br = -0.05 if (mid <= 0.27 and p95 <= 0.66) else -0.16
-    bright_val = non_zero_clamp(raw_br, min_neg_br, max_pos_br, min_abs=0.01, default_sign=-1.0)
+    bright_val = non_zero_clamp(raw_br, min_neg_br, max_pos_br, min_abs=0.01, default_sign=-1.0 if res_mid >= 0 else 1.0)
     adjust.append(("brightness", bright_val))
 
-    # LIGHT SENSATION (`light_sensation`) — ALWAYS NEGATIVE (`-0.025..-0.065`) to absorb glossy/waxy skin sheen ("siêu nhựa")!
-    raw_ls = -0.025 - max(0.0, sim["sim_mid"] - 0.26) * 0.16 - max(0.0, eff_hi - 0.50) * 0.10
-    light_sens_val = non_zero_clamp(raw_ls, -0.065, -0.025, min_abs=0.01, default_sign=-1.0)
+    if mid < 0.21 and p95 < 0.52 and not is_plastic_or_hot:
+        light_sens_val = 0.015
+    else:
+        raw_ls = -0.020 - max(0.0, sim["sim_mid"] - 0.26) * 0.15 - max(0.0, eff_hi - 0.50) * 0.10
+        light_sens_val = non_zero_clamp(raw_ls, -0.065, -0.015, min_abs=0.01, default_sign=-1.0)
     adjust.append(("light_sensation", light_sens_val))
 
-    # 4. CONTRAST (`contrast`, v3) — ALWAYS NEGATIVE (`-0.04..-0.10`) to relax steep plastic AI S-curves into soft 35mm film!
-    raw_con = -0.040 - max(0.0, sim["sim_contrast"] - 0.48) * 0.25
-    contrast_val = non_zero_clamp(raw_con, -0.10, -0.04, min_abs=0.01, default_sign=-1.0)
+    # 4. CONTRAST (`contrast`, v3) — ALWAYS NEGATIVE (`-0.02..-0.10`) to relax steep plastic AI S-curves into soft 35mm film!
+    raw_con = -0.020 - max(0.0, sim["sim_contrast"] - 0.50) * 0.24
+    contrast_val = non_zero_clamp(raw_con, -0.10, -0.02, min_abs=0.01, default_sign=-1.0)
     adjust.append(("contrast", contrast_val))
 
-    # 5. TONE / TINT (`tone`, v3) — Skintone neutralization (cancels heavy Grok magenta/purple skin cast)
+    # 5. TONE / TINT (`tone`, v3) — Skintone neutralization (cancels green or magenta skin casts)
     res_gm = sim["sim_gm"] - target_gm
-    raw_tone = res_gm * 2.5 * outlier_boost
-    tone_val = non_zero_clamp(raw_tone, -0.10, 0.06, min_abs=0.01, default_sign=-1.0)
+    raw_tone = res_gm * 2.4 * outlier_boost
+    tone_val = non_zero_clamp(raw_tone, -0.10, 0.06, min_abs=0.01, default_sign=-1.0 if res_gm < 0 else 1.0)
     adjust.append(("tone", tone_val))
 
-    # 6. TEMPERATURE (`temperature`, v3) — Skin-Aware RB Control (never warms a shot whose skin is already orange >= 0.22!)
+    # 6. TEMPERATURE (`temperature`, v3) — Skin-Aware RB Control (never warms a shot whose skin is already orange >= 0.23!)
     res_rb = sim["sim_rb"] - target_rb
-    raw_temp = -res_rb * 1.75 * outlier_boost - max(0.0, skin_rb - 0.21) * 0.95
-    max_pos_temp = -0.02 if skin_rb >= 0.22 else 0.16
+    raw_temp = -res_rb * 1.65 * outlier_boost - max(0.0, skin_rb - 0.22) * 0.90
+    max_pos_temp = -0.02 if skin_rb >= 0.23 else 0.14
     temp_val = non_zero_clamp(raw_temp, -0.24, max_pos_temp, min_abs=0.01, default_sign=1.0 if res_rb <= 0 else -1.0)
     adjust.append(("temperature", temp_val))
 
-    # 7. SATURATION (`saturation`, v1) — ALWAYS NEGATIVE (`-0.04..-0.22`) to mute neon/plastic AI skin chroma into matte 35mm!
+    # 7. SATURATION (`saturation`, v1) — Adaptive Chroma Control (strongly mutes neon/plastic skin, preserves subtle Seedance chroma)
     res_sat = sim["sim_sat"] - target_sat
-    raw_sat = -0.040 - max(0.0, res_sat) * 1.55 * outlier_boost - max(0.0, skin_sat - 0.20) * 0.85
-    sat_val = non_zero_clamp(raw_sat, -0.22, -0.04, min_abs=0.01, default_sign=-1.0)
+    if is_plastic_or_hot or res_sat > 0.015:
+        raw_sat = -0.025 - max(0.0, res_sat) * 1.45 * outlier_boost - max(0.0, skin_sat - 0.21) * 0.75
+        sat_val = non_zero_clamp(raw_sat, -0.22, -0.02, min_abs=0.01, default_sign=-1.0)
+    else:
+        raw_sat = -res_sat * 0.85
+        sat_val = non_zero_clamp(raw_sat, -0.06, 0.03, min_abs=0.01, default_sign=-1.0 if res_sat >= 0 else 1.0)
     adjust.append(("saturation", sat_val))
 
     # 8. 35MM OPTICAL DIFFUSION vs. ZOOM SUPER-RES (`sharpen`, `clear`, `particle`):
-    # On normal 1.0x clips: use NEGATIVE `clear` (`-0.015..-0.028`, Black Pro-Mist diffusion!) + subtle `sharpen` (`0.025..0.040`)
-    # to eliminate waxy plastic micro-contrast on faces. On zoomed (~150%) clips: apply Super-Res sharpen & clear!
     zoom_excess = max(0.0, float(seg_scale) - 1.0)
     if zoom_excess > 0.02:
         sh_val = round(clamp(0.065 + max(0.0, 0.040 - sharp) * 2.0 + zoom_excess * 0.16, 0.06, 0.17), 3)
         cl_val = round(clamp(0.012 + zoom_excess * 0.030, 0.010, 0.035), 3)
-    else:
+    elif is_plastic_or_hot:
         sh_val = round(clamp(0.028 + max(0.0, 0.036 - sharp) * 1.2, 0.022, 0.042), 3)
         cl_val = round(clamp(-0.015 - max(0.0, c - 0.55) * 0.05, -0.028, -0.012), 3)
+    else:
+        sh_val = round(clamp(0.048 + max(0.0, 0.042 - sharp) * 1.6, 0.035, 0.068), 3)
+        cl_val = round(clamp(0.012 + max(0.0, 0.042 - sharp) * 0.4, 0.010, 0.018), 3)
     adjust.append(("sharpen", sh_val))
     adjust.append(("clear", cl_val))
 
@@ -1156,15 +1169,18 @@ def main():
 
     if has_compound:
         draft_by_id = {sd["id"]: sd["draft"] for sd in sub_drafts if "id" in sd and "draft" in sd}
+        draft_by_combo = {sd["combination_id"]: sd["draft"] for sd in sub_drafts if sd.get("combination_id") and "draft" in sd}
         for sub_file in glob.glob(os.path.join(proj_dir, "subdraft", "*", "draft_content.json")):
             with open(sub_file, "r", encoding="utf-8") as sf:
                 sub_d = json.load(sf)
             changed_sub = False
             for sd_entry in sub_d.get("materials", {}).get("drafts", []):
                 sid = sd_entry.get("id")
-                if sid in draft_by_id:
+                cid = sd_entry.get("combination_id")
+                matched_draft = draft_by_id.get(sid) or (draft_by_combo.get(cid) if cid else None)
+                if matched_draft is not None:
                     shutil.copy2(sub_file, os.path.join(backup_dir, f"subdraft_{sid}_content.json"))
-                    sd_entry["draft"] = copy.deepcopy(draft_by_id[sid])
+                    sd_entry["draft"] = copy.deepcopy(matched_draft)
                     changed_sub = True
             if changed_sub:
                 with open(sub_file, "w", encoding="utf-8") as sf:
