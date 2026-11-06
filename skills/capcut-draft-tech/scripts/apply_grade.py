@@ -381,18 +381,18 @@ def match_optimal_lut_by_video_simulation(
     d_gm = gm - target_gm
     d_sat = sat - target_sat
 
-    ideal_midRB = clamp(-d_rb * 1.15, -0.155, 0.062)
-    ideal_mid = clamp(0.272 - d_mid * 0.45, 0.205, 0.345)
-    ideal_blk = clamp(0.056 - d_p5 * 0.32, 0.024, 0.092)
-    ideal_hi = clamp(0.738 - d_hi * 0.35, 0.640, 0.805)
-    ideal_midGM = clamp(-d_gm * 0.80, -0.030, 0.030)
-    ideal_sat = clamp(0.95 - d_sat * 1.85, 0.72, 1.14)
+    ideal_midRB = clamp(-d_rb * 1.15, -0.068, 0.062)
+    ideal_mid = clamp(0.285 - d_mid * 0.38, 0.252, 0.352)
+    ideal_blk = clamp(0.052 - d_p5 * 0.28, 0.025, 0.085)
+    ideal_hi = clamp(0.755 - d_hi * 0.28, 0.685, 0.815)
+    ideal_midGM = clamp(-d_gm * 0.80, -0.025, 0.025)
+    ideal_sat = clamp(0.98 - d_sat * 1.40, 0.86, 1.14)
 
     best_title = fallback_lut
-    best_alpha = 0.20
+    best_alpha = 0.14
     best_score = 1e9
 
-    candidate_alphas = (0.14, 0.16, 0.18, 0.20, 0.22)
+    candidate_alphas = (0.10, 0.12, 0.14, 0.16)
 
     cinematic_safe_prefixes = (
         "FILM LOOK", "CINEMATIC", "ATMOSPHERIC", "HOLLYWOOD",
@@ -403,51 +403,51 @@ def match_optimal_lut_by_video_simulation(
     )
 
     for entry in optical_db:
-        if not is_mono_video and (entry.get("tier") == "bw_mono" or entry.get("satGain", 1.0) < 0.70 or entry.get("satGain", 1.0) > 1.18):
+        if not is_mono_video and (entry.get("tier") == "bw_mono" or entry.get("satGain", 1.0) < 0.85 or entry.get("satGain", 1.0) > 1.16):
             continue
         if entry.get("tier") == "camera_log":
             continue
-        if entry.get("blk", 0.05) < 0.020 or entry.get("blk", 0.05) > 0.102:
+        if entry.get("blk", 0.05) < 0.022 or entry.get("blk", 0.05) > 0.092:
             continue
-        if entry.get("mid", 0.28) < 0.200 or entry.get("mid", 0.28) > 0.360:
+        if entry.get("mid", 0.28) < 0.246 or entry.get("mid", 0.28) > 0.358:
             continue
-        if entry.get("hi", 0.75) < 0.605 or entry.get("hi", 0.75) > 0.825:
+        if entry.get("hi", 0.75) < 0.665 or entry.get("hi", 0.75) > 0.825:
             continue
-        if abs(entry.get("hiRB", 0.0)) > 0.10 or abs(entry.get("hiGM", 0.0)) > 0.055:
+        if abs(entry.get("midRB", 0.0)) > 0.072 or abs(entry.get("hiRB", 0.0)) > 0.085 or abs(entry.get("hiGM", 0.0)) > 0.045:
             continue
 
         t = entry["title"]
         t_up = t.upper()
         if not any(t_up.startswith(pfx) for pfx in cinematic_safe_prefixes):
             continue
-        if any(bad in t_up for bad in ("VINTAGE", "RETRO", "SEPIA", "OLD", "BW", "B&W", "MONO", "GAMMA3", "GAMMA4", "GAMMA 3")):
+        if any(bad in t_up for bad in ("VINTAGE", "RETRO", "SEPIA", "OLD", "BW", "B&W", "MONO", "GAMMA3", "GAMMA4", "GAMMA 3", "WASHED")):
             continue
-        fam_bonus = -0.012 if any(k in t_up for k in preferred_families) else 0.0
-        div_pen = min(0.052, used_lut_counts.get(t, 0) * diversity_weight) if used_lut_counts else 0.0
+        fam_bonus = -0.010 if any(k in t_up for k in preferred_families) else 0.0
+        div_pen = min(0.055, used_lut_counts.get(t, 0) * diversity_weight) if used_lut_counts else 0.0
 
         lut_transfer_err = (
-            abs(entry["midRB"] - ideal_midRB) * 3.2
-            + abs(entry["mid"] - ideal_mid) * 2.6
-            + abs(entry["blk"] - ideal_blk) * 2.0
-            + abs(entry["hi"] - ideal_hi) * 1.6
+            abs(entry["midRB"] - ideal_midRB) * 3.4
+            + abs(entry["mid"] - ideal_mid) * 2.8
+            + abs(entry["blk"] - ideal_blk) * 2.2
+            + abs(entry["hi"] - ideal_hi) * 1.8
             + abs(entry["midGM"] - ideal_midGM) * 1.5
-            + abs(entry["satGain"] - ideal_sat) * 1.4
+            + abs(entry["satGain"] - ideal_sat) * 1.6
         )
 
         for alpha in candidate_alphas:
             sim = simulate_video_through_lut(video_m, entry, alpha)
             if not (sim["sim_p5"] < sim["sim_mid"] < sim["sim_hi"]):
                 continue
-            if sim["sim_p5"] < 0.010 or sim["sim_p5"] > max(0.125, p5 + 0.010):
+            if sim["sim_p5"] < 0.012 or sim["sim_p5"] > max(0.140, p5 + 0.012):
                 continue
-            if sim["sim_hi"] > max(0.89, p95 + 0.012) or sim["sim_hi"] < 0.40:
+            if sim["sim_hi"] > max(0.90, p95 + 0.015) or sim["sim_hi"] < 0.42:
                 continue
-            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > max(0.255, sat * 1.06)):
+            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > max(0.265, sat * 1.08)):
                 continue
 
             sim_err = (
-                abs(sim["sim_mid"] - target_mid) * 0.45
-                + abs(sim["sim_rb"] - target_rb) * 0.55
+                abs(sim["sim_mid"] - target_mid) * 0.40
+                + abs(sim["sim_rb"] - target_rb) * 0.50
                 + abs(sim["sim_p5"] - target_p5) * 0.35
                 + abs(sim["sim_hi"] - target_hi) * 0.25
             )
@@ -534,23 +534,23 @@ def select_scene_primary_lut_and_targets(
         else:
             act_mood = emotion
 
-        target_p5 = round(clamp(0.038 + 0.15 * min(p5, 0.12), 0.040, 0.056), 4)
-        target_hi = round(clamp(0.595 + 0.12 * (p95 - 0.55), 0.590, 0.640), 4)
-        if mid <= 0.220:
-            target_mid = 0.255
-        elif mid <= 0.285:
-            # Evening/night/dark-suit interior scenes: keep target_mid grounded (0.258..0.282) so faces & windows never glare!
-            target_mid = round(clamp(0.258 + 0.35 * (mid - 0.220), 0.258, 0.282), 4)
+        # Preserve natural Seedance brightness & vibrancy (never darken daylight/dawn scenes; gently lift dark night scenes!)
+        target_p5 = round(clamp(p5 * 0.82, 0.038, 0.092), 4)
+        target_hi = round(clamp(p95, 0.635, 0.815), 4)
+        if mid < 0.255:
+            # Dark night scenes (e.g. Night Porch / Night Woodshop): lift midtones so faces & details are bright and clear!
+            target_mid = round(clamp(mid + 0.045, 0.225, 0.285), 4)
         else:
-            # Daytime/dawn/dusk scenes: proportional matte 35mm midtones (0.292..0.335)
-            target_mid = round(clamp(0.292 + 0.22 * (mid - 0.290), 0.292, 0.335), 4)
+            # Normal/bright scenes: preserve the scene's natural midtone anchor (only harmonizing intra-scene jumps!)
+            target_mid = round(clamp(mid, 0.285, 0.455), 4)
 
-        target_rb = round(clamp(0.055 + 0.42 * (rb - 0.055), 0.045, 0.132), 4)
-        if act_mood in ("warm-human", "vintage-35mm") and target_rb < 0.088:
-            target_rb = 0.088
+        if rb > 0.195 and act_mood != "vintage-35mm":
+            target_rb = round(clamp(0.165 + 0.25 * (rb - 0.195), 0.160, 0.175), 4)
+        else:
+            target_rb = round(clamp(rb, 0.065, 0.175), 4)
 
         target_gm = -0.010 if act_mood in ("warm-human", "vintage-35mm") else -0.008
-        target_sat = round(clamp(0.095 + 0.22 * (sat - 0.10), 0.095, 0.130), 4)
+        target_sat = round(clamp(sat * 0.98, 0.130, 0.200), 4)
         use_vignette = False
 
         if act_mood == "warm-human":
@@ -696,14 +696,14 @@ def compute_shot_lut_and_adjustments(
     skin_sat = m.get("skin_sat", sat)
     skin_hi = m.get("skin_hi", p95)
 
-    # Skin-Aware effective metrics so blue windows / gray suits NEVER mask radioactive orange/glaring skin!
-    is_plastic_or_hot = (c > 0.66 or sat > 0.165 or skin_sat > 0.235 or skin_rb > 0.235 or p95 > 0.72)
-    eff_in_rb = max(rb, skin_rb - 0.075) if is_plastic_or_hot else max(rb, 0.65 * rb + 0.35 * (skin_rb - 0.075))
-    eff_in_sat = max(sat, skin_sat - 0.050) if is_plastic_or_hot else max(sat, 0.60 * sat + 0.40 * (skin_sat - 0.050))
+    # Skin-Aware effective metrics (only flag truly extreme tungsten/neon skin >= 0.255)
+    is_extreme_hot_skin = (skin_rb > 0.255 or skin_sat > 0.265)
+    eff_in_rb = max(rb, 0.70 * rb + 0.30 * (skin_rb - 0.065)) if is_extreme_hot_skin else rb
+    eff_in_sat = max(sat, 0.70 * sat + 0.30 * (skin_sat - 0.045)) if is_extreme_hot_skin else sat
 
     target_p5 = scene_cfg.get("target_p5", 0.048)
     target_mid = scene_cfg["target_mid"]
-    target_hi = scene_cfg.get("target_hi", 0.610)
+    target_hi = scene_cfg.get("target_hi", 0.720)
     target_rb = scene_cfg["target_rb"]
     target_gm = scene_cfg["target_gm"]
     target_sat = scene_cfg["target_sat"]
@@ -720,19 +720,19 @@ def compute_shot_lut_and_adjustments(
     eff_m = dict(m, rb=eff_in_rb, sat=eff_in_sat)
 
     # Stage 1 (zorder 2000): Trigger Counter-Balance Sibling LUT whenever shot deviates from Scene Target
-    if abs(d_mid_target) > 0.030 or abs(d_rb_target) > 0.022 or abs(d_p5_target) > 0.020 or skin_rb > 0.230 or skin_sat > 0.230:
-        fb = "FILM LOOK (18).cube" if (d_rb_target > 0.028 or skin_rb > 0.235) else ("SCC-rec709 (27).cube" if d_mid_target < -0.038 else "DRONE (19).cube")
+    if abs(d_mid_target) > 0.025 or abs(d_rb_target) > 0.018 or abs(d_p5_target) > 0.018 or is_extreme_hot_skin:
+        fb = "SCC-rec709 (1).cube" if (d_rb_target > 0.022 or is_extreme_hot_skin) else ("SCC-rec709 (27).cube" if d_mid_target < -0.028 else "COMMERCIAL (10).cube")
         lut_title, base_val, shot_state = match_optimal_lut_by_video_simulation(
             optical_db, eff_m, target_mid, target_rb, target_gm, target_sat,
             ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE", "FILM LOOK", "DRONE", "DRAMATIC", "MOOD", "COMMERCIAL", "WEDDING"),
             fb, target_p5=target_p5, target_hi=target_hi,
-            used_lut_counts=used_shot_luts, diversity_weight=0.007
+            used_lut_counts=used_shot_luts, diversity_weight=0.009
         )
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Simulated: {shot_state}]"
     elif used_shot_luts is not None:
         used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
-    lut_val = round(base_val + clamp((target_mid - mid) * 0.04, -0.010, 0.010), 3)
+    lut_val = round(clamp(base_val + clamp((target_mid - mid) * 0.03, -0.010, 0.010), 0.10, 0.16), 3)
 
     # Simulate exact Post-LUT optical state `sim` so Stage 2 (Adjust at zorder 8004) cancels the exact residual
     lut_entry = next((e for e in (optical_db or []) if e["title"] == lut_title), None)
@@ -741,89 +741,88 @@ def compute_shot_lut_and_adjustments(
     else:
         sim = {"sim_p5": p5, "sim_mid": mid, "sim_hi": p95, "sim_contrast": c, "sim_rb": eff_in_rb, "sim_gm": gm, "sim_sat": eff_in_sat}
 
-    outlier_boost = 1.18 if force_neighbor_match else 1.0
+    outlier_boost = 1.15 if force_neighbor_match else 1.0
 
     adjust = []
 
-    # Stage 2 (zorder 8004) — Adaptive Matte 35mm Anti-Glare / Anti-Plastic 12-Slider Adjust Stack per Child Video:
-    # 1. SHADOW (`shadow`, v3) — Open crushed darks (`+0.01..+0.10`) or anchor milky blacks (`-0.08..0`)
+    # Stage 2 (zorder 8004) — Crisp, Luminous, Non-Muddy 35mm 12-Slider Adjust Stack per Child Video:
+    # 1. SHADOW (`shadow`, v3) — Anchor milky blacks (`-0.05..-0.01` to eliminate muddiness) or open dark night shadows (`+0.02..+0.09`)
     res_p5 = sim["sim_p5"] - target_p5
-    if res_p5 > 0:
-        raw_shd = -res_p5 * 1.25 * outlier_boost
+    if mid < 0.255 or res_p5 < -0.005:
+        raw_shd = max(0.02, -res_p5 * 1.40 * outlier_boost + max(0.0, 0.255 - mid) * 0.45)
+        shadow_val = non_zero_clamp(raw_shd, 0.02, 0.09, min_abs=0.01, default_sign=1.0)
     else:
-        raw_shd = -res_p5 * 1.80 * outlier_boost + max(0.0, 0.145 - p25) * 0.35
-    shadow_val = non_zero_clamp(raw_shd, -0.08, 0.10, min_abs=0.01, default_sign=1.0)
+        raw_shd = -max(0.01, res_p5 * 0.85 * outlier_boost + max(0.0, p5 - 0.085) * 0.25)
+        shadow_val = non_zero_clamp(raw_shd, -0.05, -0.01, min_abs=0.01, default_sign=-1.0)
     adjust.append(("shadow", shadow_val))
 
-    # 2. HIGHLIGHT (`highlight`, v3) — ALWAYS NEGATIVE (`-0.04..-0.18`) to roll off window/forehead glare ("chói") & plastic sheen!
-    eff_hi = max(sim["sim_hi"], skin_hi + (0.07 if is_plastic_or_hot else 0.02))
-    raw_hl = -0.045 - max(0.0, eff_hi - 0.46) * 0.42 * outlier_boost - max(0.0, p99 - 0.62) * 0.32
-    highlight_val = non_zero_clamp(raw_hl, -0.18, -0.04, min_abs=0.01, default_sign=-1.0)
+    # 2. HIGHLIGHT (`highlight`, v3) — Gentle highlight protection (`-0.04..+0.02`) so sky/water stays bright & crisp without clipping
+    res_hi = sim["sim_hi"] - target_hi
+    if p95 < 0.58 and mid < 0.28:
+        highlight_val = 0.015
+    else:
+        raw_hl = -0.015 - max(0.0, res_hi) * 0.30 - max(0.0, p99 - 0.85) * 0.20
+        highlight_val = non_zero_clamp(raw_hl, -0.045, -0.01, min_abs=0.01, default_sign=-1.0)
     adjust.append(("highlight", highlight_val))
 
-    # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "") — Anti-Glare Exposure Control:
+    # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "") — Preserve natural brightness & lift dark scenes!
     res_mid = sim["sim_mid"] - target_mid
-    raw_br = -res_mid * 0.95 * outlier_boost - max(0.0, p95 - 0.65) * 0.20
-    if is_plastic_or_hot or p95 >= 0.60 or skin_hi >= 0.52:
-        max_pos_br = -0.01
-    elif mid < 0.23 and p95 < 0.56:
-        max_pos_br = 0.08
+    raw_br = -res_mid * 0.75 * outlier_boost
+    if mid < 0.255:
+        bright_val = non_zero_clamp(max(0.025, raw_br), 0.02, 0.08, min_abs=0.01, default_sign=1.0)
+        light_sens_val = 0.020
+    elif abs(res_mid) <= 0.025:
+        bright_val = non_zero_clamp(raw_br + 0.010, -0.015, 0.025, min_abs=0.01, default_sign=1.0)
+        light_sens_val = 0.010
     else:
-        max_pos_br = 0.03
-    min_neg_br = -0.05 if (mid <= 0.27 and p95 <= 0.66) else -0.16
-    bright_val = non_zero_clamp(raw_br, min_neg_br, max_pos_br, min_abs=0.01, default_sign=-1.0 if res_mid >= 0 else 1.0)
+        bright_val = non_zero_clamp(raw_br, -0.055, 0.055, min_abs=0.01, default_sign=-1.0 if res_mid > 0 else 1.0)
+        light_sens_val = non_zero_clamp(-res_mid * 0.25, -0.020, 0.020, min_abs=0.01, default_sign=-1.0 if res_mid > 0 else 1.0)
     adjust.append(("brightness", bright_val))
-
-    if mid < 0.21 and p95 < 0.52 and not is_plastic_or_hot:
-        light_sens_val = 0.015
-    else:
-        raw_ls = -0.020 - max(0.0, sim["sim_mid"] - 0.26) * 0.15 - max(0.0, eff_hi - 0.50) * 0.10
-        light_sens_val = non_zero_clamp(raw_ls, -0.065, -0.015, min_abs=0.01, default_sign=-1.0)
     adjust.append(("light_sensation", light_sens_val))
 
-    # 4. CONTRAST (`contrast`, v3) — ALWAYS NEGATIVE (`-0.02..-0.10`) to relax steep plastic AI S-curves into soft 35mm film!
-    raw_con = -0.020 - max(0.0, sim["sim_contrast"] - 0.50) * 0.24
-    contrast_val = non_zero_clamp(raw_con, -0.10, -0.02, min_abs=0.01, default_sign=-1.0)
+    # 4. CONTRAST (`contrast`, v3) — POSITIVE crisp depth (`+0.015..+0.040`) so image is NEVER flat or muddy ("chống bệt màu")!
+    if c > 0.68 and p5 < 0.035:
+        contrast_val = -0.015
+    else:
+        raw_con = 0.020 + max(0.0, 0.56 - sim["sim_contrast"]) * 0.15 + max(0.0, p5 - 0.075) * 0.12
+        contrast_val = non_zero_clamp(raw_con, 0.015, 0.040, min_abs=0.01, default_sign=1.0)
     adjust.append(("contrast", contrast_val))
 
     # 5. TONE / TINT (`tone`, v3) — Skintone neutralization (cancels green or magenta skin casts)
     res_gm = sim["sim_gm"] - target_gm
-    raw_tone = res_gm * 2.4 * outlier_boost
-    tone_val = non_zero_clamp(raw_tone, -0.10, 0.06, min_abs=0.01, default_sign=-1.0 if res_gm < 0 else 1.0)
+    raw_tone = res_gm * 1.8 * outlier_boost
+    tone_val = non_zero_clamp(raw_tone, -0.05, 0.04, min_abs=0.01, default_sign=-1.0 if res_gm < 0 else 1.0)
     adjust.append(("tone", tone_val))
 
-    # 6. TEMPERATURE (`temperature`, v3) — Skin-Aware RB Control (never warms a shot whose skin is already orange >= 0.23!)
+    # 6. TEMPERATURE (`temperature`, v3) — Harmonize intra-scene warmth jumps while taming only extreme tungsten orange (`skin_rb > 0.25`)
     res_rb = sim["sim_rb"] - target_rb
-    raw_temp = -res_rb * 1.65 * outlier_boost - max(0.0, skin_rb - 0.22) * 0.90
-    max_pos_temp = -0.02 if skin_rb >= 0.23 else 0.14
-    temp_val = non_zero_clamp(raw_temp, -0.24, max_pos_temp, min_abs=0.01, default_sign=1.0 if res_rb <= 0 else -1.0)
+    raw_temp = -res_rb * 1.35 * outlier_boost - max(0.0, skin_rb - 0.245) * 0.70
+    max_pos_temp = -0.01 if skin_rb >= 0.255 else 0.10
+    temp_val = non_zero_clamp(raw_temp, -0.14, max_pos_temp, min_abs=0.01, default_sign=1.0 if res_rb <= 0 else -1.0)
     adjust.append(("temperature", temp_val))
 
-    # 7. SATURATION (`saturation`, v1) — Adaptive Chroma Control (strongly mutes neon/plastic skin, preserves subtle Seedance chroma)
+    # 7. SATURATION (`saturation`, v1) — Keep colors lively & fresh (`+0.01..+0.03`), only taming extreme tungsten saturation
     res_sat = sim["sim_sat"] - target_sat
-    if is_plastic_or_hot or res_sat > 0.015:
-        raw_sat = -0.025 - max(0.0, res_sat) * 1.45 * outlier_boost - max(0.0, skin_sat - 0.21) * 0.75
-        sat_val = non_zero_clamp(raw_sat, -0.22, -0.02, min_abs=0.01, default_sign=-1.0)
+    if is_extreme_hot_skin or res_sat > 0.030:
+        raw_sat = -res_sat * 1.10 * outlier_boost - max(0.0, skin_sat - 0.25) * 0.50
+        sat_val = non_zero_clamp(raw_sat, -0.08, -0.01, min_abs=0.01, default_sign=-1.0)
     else:
-        raw_sat = -res_sat * 0.85
-        sat_val = non_zero_clamp(raw_sat, -0.06, 0.03, min_abs=0.01, default_sign=-1.0 if res_sat >= 0 else 1.0)
+        raw_sat = 0.012 - res_sat * 0.65
+        sat_val = non_zero_clamp(raw_sat, -0.02, 0.035, min_abs=0.01, default_sign=1.0)
     adjust.append(("saturation", sat_val))
 
-    # 8. 35MM OPTICAL DIFFUSION vs. ZOOM SUPER-RES (`sharpen`, `clear`, `particle`):
+    # 8. OPTICAL CLARITY & SUPER-RES SHARPNESS (`sharpen`, `clear`, `particle`) — ALWAYS POSITIVE (`clear > 0`) so image is crystal-clear!
     zoom_excess = max(0.0, float(seg_scale) - 1.0)
     if zoom_excess > 0.02:
-        sh_val = round(clamp(0.065 + max(0.0, 0.040 - sharp) * 2.0 + zoom_excess * 0.16, 0.06, 0.17), 3)
-        cl_val = round(clamp(0.012 + zoom_excess * 0.030, 0.010, 0.035), 3)
-    elif is_plastic_or_hot:
-        sh_val = round(clamp(0.028 + max(0.0, 0.036 - sharp) * 1.2, 0.022, 0.042), 3)
-        cl_val = round(clamp(-0.015 - max(0.0, c - 0.55) * 0.05, -0.028, -0.012), 3)
+        sh_val = round(clamp(0.070 + max(0.0, 0.040 - sharp) * 2.0 + zoom_excess * 0.16, 0.065, 0.17), 3)
+        cl_val = round(clamp(0.022 + zoom_excess * 0.030, 0.020, 0.042), 3)
     else:
-        sh_val = round(clamp(0.048 + max(0.0, 0.042 - sharp) * 1.6, 0.035, 0.068), 3)
-        cl_val = round(clamp(0.012 + max(0.0, 0.042 - sharp) * 0.4, 0.010, 0.018), 3)
+        sh_val = round(clamp(0.050 + max(0.0, 0.042 - sharp) * 1.6, 0.040, 0.072), 3)
+        cl_val = round(clamp(0.018 + max(0.0, 0.042 - sharp) * 0.4, 0.015, 0.028), 3)
     adjust.append(("sharpen", sh_val))
     adjust.append(("clear", cl_val))
 
-    pt_val = round(clamp(0.025 + max(0.0, 0.032 - hf_noise) * 1.5, 0.020, 0.040), 3)
+    pt_val = round(clamp(0.020 + max(0.0, 0.030 - hf_noise) * 1.2, 0.015, 0.030), 3)
     adjust.append(("particle", pt_val))
 
     if scene_cfg["use_vignette"]:
