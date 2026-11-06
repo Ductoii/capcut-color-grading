@@ -561,6 +561,8 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
             # In sf-board.json projects, distinct time-of-day/location variants have distinct base_loc (e.g. IMG6 vs IMG6B, PRIVATE_DINING_NIGHT vs HEARING_ROOM_DAY).
             # Grouping strictly by base_loc guarantees 100% of scenes in the same room share one unified target & LUT!
             regime = "SFB_LOC"
+        elif not has_seedance_hook and re.match(r"^E\d+_(DAWN|DAY|DUSK|NIGHT):", bg_code):
+            regime = re.match(r"^E\d+_(DAWN|DAY|DUSK|NIGHT):", bg_code).group(1)
         elif bg_code == "E0:BG1" or "NIGHT" in bg_code or "NIGH" in bg_code or (a["mid"] <= 0.265 and a["rb"] <= 0.025) or (a["rb"] <= -0.012 and a["mid"] <= 0.335):
             regime = "DARK_STORM_NIGHT"
             base_loc = "NIGHT_EXT"

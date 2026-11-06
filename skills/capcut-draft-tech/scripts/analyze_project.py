@@ -214,14 +214,35 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
             continue
         try:
             lines = open(cfile, "r", encoding="utf-8", errors="ignore").readlines()
+            # Identify which BG<N>a / BG<N>b pairs are camera angles ("góc") of the same location vs distinct rooms
+            angle_bg_bases = set()
+            full_txt = "".join(lines)
+            for m_hdr in re.finditer(r"----([^\n]+)----\s*\n(?:SCENE[^\n]*\n)?\s*\d{1,3}\s*\|[^|]+\|[^|]+\|\s*(BG\d+)[a-z]", full_txt, re.IGNORECASE):
+                hdr_low = m_hdr.group(1).lower()
+                if "góc" in hdr_low or "angle" in hdr_low:
+                    angle_bg_bases.add(m_hdr.group(2).upper())
+
             clip_map = {}
             era_idx = 0
             era_label = "E0"
+            last_tod = ""
             for line in lines:
                 line_s = line.strip()
                 if line_s.startswith("----") and line_s.endswith("----"):
-                    era_idx += 1
-                    era_label = f"E{era_idx}"
+                    hdr_up = line_s.upper()
+                    if "ĐÊM" in hdr_up or "TỐI" in hdr_up or "NIGHT" in hdr_up:
+                        tod = "NIGHT"
+                    elif "HOÀNG HÔN" in hdr_up or "CHIỀU" in hdr_up or "DUSK" in hdr_up or "SUNSET" in hdr_up:
+                        tod = "DUSK"
+                    elif "BÌNH MINH" in hdr_up or "DAWN" in hdr_up:
+                        tod = "DAWN"
+                    else:
+                        tod = "DAY"
+                    is_angle_switch = ("GÓC TỪ" in hdr_up or "GÓC NHÌN" in hdr_up)
+                    if not is_angle_switch or tod != last_tod or era_idx == 0:
+                        era_idx += 1
+                    last_tod = tod
+                    era_label = f"E{era_idx}_{tod}"
                     continue
                 if "THẺ CHỮ" in line_s or "THE CHU" in line_s.upper():
                     era_idx += 1
@@ -234,10 +255,17 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
                 if m_row:
                     cnum = int(m_row.group(1))
                     refs_str = m_row.group(2)
-                    m_bg = re.search(r"(BG\d+)([a-z])?", refs_str)
+                    m_bg = re.search(r"(BG\d+)([a-z])?", refs_str, re.IGNORECASE)
                     if m_bg:
-                        base_b, suf_b = m_bg.group(1), (m_bg.group(2) or "").lower()
-                        bg_norm = f"{base_b}C" if suf_b == "c" else base_b
+                        base_b, suf_b = m_bg.group(1).upper(), (m_bg.group(2) or "").upper()
+                        if suf_b == "C":
+                            bg_norm = f"{base_b}C"
+                        elif suf_b and base_b in angle_bg_bases and suf_b in ("A", "B"):
+                            bg_norm = base_b
+                        elif suf_b and not angle_bg_bases:
+                            bg_norm = base_b
+                        else:
+                            bg_norm = f"{base_b}{suf_b}"
                         clip_map[cnum] = f"{era_label}:{bg_norm}"
                     else:
                         clip_map[cnum] = ""
@@ -251,10 +279,10 @@ def discover_ground_truth_scene_map(video_paths: list) -> tuple[dict, str]:
                         era_idx += 1
                         era_label = f"E{era_idx}"
                         continue
-                    m_bg = re.search(r"(BG\d+)([a-z])?", body)
+                    m_bg = re.search(r"(BG\d+)([a-z])?", body, re.IGNORECASE)
                     if m_bg:
-                        base_b, suf_b = m_bg.group(1), (m_bg.group(2) or "").lower()
-                        bg_norm = f"{base_b}C" if suf_b == "c" else base_b
+                        base_b, suf_b = m_bg.group(1).upper(), (m_bg.group(2) or "").upper()
+                        bg_norm = f"{base_b}C" if suf_b == "C" else base_b
                         clip_map[cnum] = f"{era_label}:{bg_norm}"
             if len(clip_map) >= 10:
                 return clip_map, cfile
