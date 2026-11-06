@@ -1,90 +1,81 @@
 ---
 name: capcut-draft-tech
-description: >-
-  Technical execution engine for CapCut macOS projects: bulk-importing .cube/.3dl LUTs
-  into LutImportCfg.json, extracting multi-frame 16-metric ffmpeg video diagnostics,
-  constructing 14-parameter CapCut materials.effects JSON payloads, and safely syncing
-  root drafts, Timelines, and Compound Clip subdrafts. Pair with capcut-ai-colorist
-  for pre-grading user intake, emotional direction, and colorist decisions.
+description: Technical execution engine for CapCut macOS projects: deterministic source-duration model detection (Seedance, Grok, Omni, Hybrid), ground-truth BANGTRA/PROMPT_ANH_REF/sf-board.json scene & lighting regime mapping, parallel segment-level source_timerange ffmpeg diagnostics with automatic /tmp caching, 3D-trilinear optical LUT selection, non-canceling 14-parameter CapCut materials.effects JSON injection, and full synchronization across Root, Timelines, mini_draft.json, and Compound Clip subdrafts. Pair with capcut-ai-colorist.
 ---
 
-# CapCut macOS Technical Engine: Multi-Frame Video Diagnostics, 14-Parameter Shader Schema & Draft Sync
+# CapCut Draft Technical Engine (`capcut-draft-tech`)
 
-This skill covers **only** the technical mechanics of analyzing videos and reading/writing CapCut macOS project files (`com.lveditor.draft/<PROJECT_ID>`). Always follow the **Pre-Grading User Intake** and colorist rules in **`capcut-ai-colorist`** before running `apply_grade.py`.
+## Overview
+
+`capcut-draft-tech` provides the deterministic execution engine for grading CapCut macOS timelines in **under 30 seconds**. Pair with **`capcut-ai-colorist`** for colorist principles and model-specific conditioning.
 
 ---
 
-## 1. CLI Workflow (`/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/`)
+## 1. Bundled Scripts & Optical Database
 
-### Step 1 — Run Read-Only Multi-Frame Video Analysis (Before Asking User)
-```bash
-python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" \
-  "1026 - THU SKILL MOI" \
-  --out "/tmp/metrics_1026.json"
-```
-*(After running Step 1, **STOP and ask the user** the 2 mandatory questions defined in `capcut-ai-colorist`: Model Source/Outliers & Emotional Direction).*
+All scripts and resources live inside this skill folder:
+- [`scripts/analyze_project.py`](scripts/analyze_project.py):
+  - Auto-detects the AI video model (`seedance`, `grok`, `omni`, `hybrid`) from un-cut source video durations (`video suộc gốc`).
+  - Discovers ground-truth scene maps (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `*PROMPT*.txt`, `sf-board.json`), scoring candidate tables by clip count and duration column (`30s` vs `10s`).
+  - Merges reverse camera angles (`"góc"` $\rightarrow$ `BG<N>`) while keeping distinct sub-locations separate, and classifies each scene's lighting regime (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`, `is_flashback`).
+  - Extracts 15-metric segment diagnostics at exact `source_timerange` in parallel (`ThreadPoolExecutor(max_workers=12)`), caches to `/tmp/capcut_metrics_<slug>.json`, and renders `/tmp/<Project>_raw_scenes.jpg`.
+- [`scripts/apply_grade.py`](scripts/apply_grade.py):
+  - Reuses `/tmp/capcut_metrics_<slug>.json` automatically (or extracts missing segments in parallel).
+  - Applies **Stage 1 (LUT at `zorder: 2000` with `enable_skin_tone_correction: true`)** + **Stage 2 (Non-Canceling 12 Adjust Sliders at `zorder: 8004`)** to every child video segment (`video con`), never double-stacking onto Compound Clip wrappers or photo overlays.
+  - Promotes active LUTs into `LutImportCfg.json[0:100]` (`index <= 99`) using fast regex scanning so CapCut's Adjustment $\rightarrow$ LUT dropdown never displays `"None"`.
+  - Synchronizes `draft_info.json`, `draft_info.json.bak`, `template-2.tmp`, `Timelines/*/attachment/patch/mini_draft.json` (`patch.json` reset), and `subdraft/*/draft_content.json`.
+  - Renders `/tmp/<Project>_graded_comparison.jpg` using cached 3D trilinear `.cube` interpolation in ~2–4 seconds.
+- [`scripts/import_luts.py`](scripts/import_luts.py):
+  - Bulk-imports `.cube` / `.3dl` LUTs into `/Users/daho100/Movies/CapCut/User Data/Resources/Lut/LutImportCfg.json`.
+- [`resources/lut_optical_db.json`](resources/lut_optical_db.json):
+  - Pre-measured 3D-trilinear optical transfer database for all 1,636 `.cube` LUTs (`blk`, `shd`, `mid`, `hi`, `shdRB`, `midRB`, `hiRB`, `midGM`, `hiGM`, `sknRB`, `sknGM`, true multi-patch `satGain`, and `tier`).
 
-### Step 2 — Apply Empirical Per-Clip Grading + 12-Slider Adjust Emulation (After User Confirms)
+---
+
+## 2. Deterministic Source-Duration Model Detection (`detect_source_models`)
+
+`detect_source_models(all_seg_tuples, proj_dir)` inspects the un-cut duration of every unique source video (`materials.videos[].duration` in microseconds, falling back to `ffprobe`):
+- **No source video `> 10.5s`** (`max <= 10.5s`, typically `10s`) $\rightarrow$ **`omni`** (`Google Omni 1.1`).
+- **Source videos span `6s / 10s / 15s`** (has `10.5s < dur <= 15.5s`, none `> 15.5s`) $\rightarrow$ **`grok`** (`Grok Video`).
+- **Has source video(s) `> 15.5s` (`~25s–30s`)**:
+  - If `>= 65%` of unique source videos are `<= 10.5s` (`10s` body clips with a `30s` opening hook) $\rightarrow$ **`hybrid`**.
+  - Otherwise $\rightarrow$ **`seedance`** (with per-clip `clip_model` tagging any `6s–15s` replacement clips inside the timeline).
+
+---
+
+## 3. Standard CLI Execution (< 30 Seconds End-to-End)
+
+> **CRITICAL RULE (YAGNI)**: Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session. Use CLI flags (`--emotion`, `--model`, `--match-clips`, `--plan`, `--allow-stylized`, `--allow-bw`, `--relaunch`) for any customization.
+
 ```bash
-python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/apply_grade.py" \
-  "1026 - THU SKILL MOI" \
-  --metrics "/tmp/metrics_1026.json" \
-  --emotion "narrative-arc" \
+# Step 1: Analyze project, auto-detect model, map scenes & cache metrics (~15-30s)
+python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" "<PROJECT_NAME_OR_ID>"
+
+# Step 2: Apply 35mm grade, sync all CapCut draft mirrors & render comparison sheet (~2-5s)
+python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/apply_grade.py" "<PROJECT_NAME_OR_ID>" \
+  --emotion narrative-arc \
+  --auto-match-outliers \
   --relaunch
 ```
-- Supported `--emotion` modes:
-  - `narrative-arc` (default: adapts target exposure, warmth, and LUT dynamically across Opening -> Conflict -> Climax -> Finale)
-  - `warm-human` (warm, empathetic, rosy skin & golden highlights)
-  - `dramatic-contrast` (deep shadows, crisp teal/warm separation, subtle vignette)
-  - `luxury-crisp` (clean whites, golden brass warmth, high clarity)
-  - `vintage-35mm` (rich Kodak 35mm grain, warm halation, soft contrast roll-off)
-- Optional flags:
-  - `--match-clips "1.mp4,17(2).mp4"`: Explicitly color-match listed clips to their immediate same-scene neighbors.
-  - `--auto-match-outliers`: Automatically blend any clip whose `|dRB| > 0.055` or `|dMid| > 0.065` jumps sharply against both immediate neighbors.
-  - `--plan "/path/to/custom_plan.json"`: Override specific segments or the entire timeline with an explicit AI-authored JSON grading plan.
 
-### Utility — Bulk-Import `.cube` / `.3dl` LUTs into CapCut
-```bash
-python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/import_luts.py" \
-  "/path/to/lut_folder"
-```
+### Optional CLI Flags for `apply_grade.py`
+- `--model {auto,seedance,grok,omni,hybrid}`: Defaults to `auto` (source-duration detection).
+- `--emotion {narrative-arc,warm-human,dramatic-contrast,luxury-crisp,vintage-35mm}`: Emotional grading direction (default: `narrative-arc`).
+- `--auto-match-outliers`: Boosts local neighbor convergence on intra-scene outlier cuts.
+- `--match-clips "12.mp4,15.mp4"`: Forces specific clips to strongly match immediate neighbors.
+- `--allow-stylized`: Unlocks Tier 2 (`stylized_rec709`) LUTs alongside Tier 1 (`core_rec709`).
+- `--allow-bw`: Unlocks Tier 3 (`bw_mono`) LUTs for flashback/noir scenes (`is_flashback=True`).
+- `--plan /path/to/plan.json`: Applies custom per-segment LUT/Adjust overrides without modifying code.
 
 ---
 
-## 2. Complete 14-Parameter CapCut Adjust & LUT Shader Schema (`materials.effects`)
+## 4. CapCut `materials.effects` & Draft Synchronization Reference
 
-CapCut's `7501974767453474064` (`lumi_hub_path` / `DefaultAdjustBundle`) color engine supports **14 distinct effect types** on each segment (`segment["extra_material_refs"]`, with `enable_lut = True` and `enable_adjust = True`). Every effect MUST carry its exact shader `version` string:
-
-| `type` | Mandatory `version` | `value` Range | Visual Parameter Controlled |
-| :--- | :---: | :---: | :--- |
-| `"lut"` | `""` | `0.0 .. 1.0` | 3D `.cube` LUT intensity (`path = "<CUBE_PATH>;<EFFECT_CACHE>"`, `enable_skin_tone_correction = true`). |
-| `"brightness"` | `"v2"` | `-1.0 .. 1.0` | Overall exposure / midtone luma shift (`brightness_v2`). |
-| `"contrast"` | `"v3"` | `-1.0 .. 1.0` | Sigmoid S-curve contrast around pivot `0.435` (`contrast_v3`). |
-| `"highlight"` | `"v3"` | `-1.0 .. 1.0` | Highlight shoulder compression (`<0` pulls down hot `P95/P99`; `>0` boosts highlights; `shadow_highlight_v3_gles3`). |
-| `"shadow"` | `"v3"` | `-1.0 .. 1.0` | Shadow toe control (`<0` anchors milky `P5/P25` blacks; `>0` lifts crushed shadows; `shadow_highlight_v3_gles3`). |
-| `"light_sensation"` | `""` | `-1.0 .. 1.0` | Brilliance / midtone micro-illumination (`light_sensation`). |
-| `"saturation"` | `"v1"` | `-1.0 .. 1.0` | Global chroma multiplier (`saturation_v1`). |
-| `"temperature"` | `"v3"` | `-1.0 .. 1.0` | Planckian locus Blue (`<0`) ↔ Amber (`>0`) color temperature (`temperature_tone_v3`). |
-| `"tone"` | `"v3"` | `-1.0 .. 1.0` | Green (`<0`) ↔ Magenta/Rosy (`>0`) tint axis (`temperature_tone_v3`). |
-| `"fade"` | `""` | `0.0 .. 1.0` | Matte black-point fade (`fade`). |
-| `"sharpen"` | `"v1"` | `0.0 .. 1.0` | Edge acutance / micro-detail (`sharpen_v1`). |
-| `"clear"` | `""` | `0.0 .. 1.0` | Local midtone clarity / micro-contrast (`clear`). |
-| `"particle"` | `"v2"` | `0.0 .. 1.0` | Organic 35mm film grain (`particle_v2`). |
-| `"vignetting"` | `"v1"` | `-1.0 .. 1.0` | Optical lens vignette fall-off (`>0` darkens corners; `vignetting_v1`). |
-
----
-
-## 3. CapCut macOS File Synchronization Topology
-
-1. **Always Quit CapCut Before Writing**:
-   - Run `osascript -e 'tell application "CapCut" to quit'` before writing JSON files.
-2. **Sync All 6 Root & Timeline Files Identically**:
-   - `draft_info.json`, `draft_info.json.bak`, `template-2.tmp`
-   - `Timelines/<TIMELINE_UUID>/draft_info.json`, `draft_info.json.bak`, `template-2.tmp` *(never touch `template.tmp`)*.
-3. **Sync Compound Clip (`subdraft`) & `mini_draft.json`**:
-   - Copy `root_draft["materials"]["drafts"][i]["draft"]` into every matching `subdraft/<SUBDRAFT_UUID>/draft_content.json` AND sync `adjust` dictionaries across `Timelines/<TIMELINE_UUID>/attachment/patch/mini_draft.json` (`segments` and `material_drafts[].segments`).
-4. **Reset Patch Queue**:
-   - Write `{"patch_data":[]}` to `Timelines/<TIMELINE_UUID>/attachment/patch/patch.json`.
-5. **Promote Active Project LUTs into `LutImportCfg.json[0:100]` (`index <= 99`)**:
-   - CapCut's C++ engine (`ImportLUTDataManager::loadImportedLutList` at `0xbc7d028: cmp x8, #0x63; b.hi` and `VELutSpinComboBoxViewModel::createPopupItems` at `0x5830484: cmp w27, #0x63; b.gt` in `libVECreator.dylib`) hardcodes a strict **100-LUT limit (`index 0..99`)** when loading `LutImportCfg.json` into memory and the UI dropdown. Any LUT at `index >= 100` displays as `"None"` in CapCut's `Adjustment -> LUT` dropdown.
-   - `apply_grade.py` automatically promotes all LUTs used in the current project (`index 0..K-1`) and other active projects (`index K..99`, deduplicated by `os.path.basename(path)`) to the top of `LutImportCfg.json` before relaunching CapCut.
+1. **14-Parameter Schema & Version Map**:
+   - Every effect uses `effect_id = resource_id = "7501974767453474064"`.
+   - Exact `version` strings: `lut: ""`, `brightness: "v2"`, `contrast: "v3"`, `highlight: "v3"`, `shadow: "v3"`, `light_sensation: ""`, `saturation: "v1"`, `temperature: "v3"`, `tone: "v3"`, `fade: ""`, `sharpen: "v1"`, `clear: ""`, `particle: "v2"`, `vignetting: "v1"`.
+   - On every `lut` effect, `enable_skin_tone_correction: True` activates CapCut's neural `tt_skin_seg` skin protection mask.
+2. **Top-100 `LutImportCfg.json` Promotion (`index 0..99`)**:
+   - CapCut's C++ `ImportLUTDataManager::loadImportedLutList` (`cmp x8, #0x63; b.hi`) and `VELutSpinComboBoxViewModel::createPopupItems` (`cmp w27, #0x63; b.gt`) only load indices `0..99` into the UI dropdown. `promote_active_luts_in_cfg()` automatically places all active project LUTs at `index 0..K-1`.
+3. **Full Draft Mirror Sync**:
+   - Writes `draft_info.json`, `draft_info.json.bak`, `template-2.tmp` in both root and `Timelines/<UUID>/`, updates `Timelines/<UUID>/attachment/patch/mini_draft.json` (`patch.json` reset to `{"patch_data":[]}`), and syncs `subdraft/<UUID>/draft_content.json` for Compound Clips.
