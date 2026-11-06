@@ -36,7 +36,27 @@ def load_optical_db(lut_map: dict) -> list[dict]:
         return []
     with open(OPTICAL_DB_PATH, "r", encoding="utf-8") as f:
         db = json.load(f)
-    return [entry for entry in db if entry.get("title") in lut_map]
+    seen_bnames = set()
+    seen_sigs = set()
+    deduped = []
+    for entry in db:
+        t = entry.get("title", "")
+        if t not in lut_map or not t.lower().endswith(".cube"):
+            continue
+        bname = os.path.basename(lut_map[t])
+        sig = (
+            round(entry.get("blk", 0.05), 3),
+            round(entry.get("mid", 0.28), 3),
+            round(entry.get("hi", 0.75), 3),
+            round(entry.get("midRB", 0.0), 3),
+            round(entry.get("satGain", 1.0), 2),
+        )
+        if bname in seen_bnames or sig in seen_sigs:
+            continue
+        seen_bnames.add(bname)
+        seen_sigs.add(sig)
+        deduped.append(entry)
+    return deduped
 
 VERSION_MAP = {
     "lut": "",
@@ -328,79 +348,117 @@ def match_optimal_lut_by_video_simulation(
     allow_bw: bool = False,
     target_p5: float = 0.046,
     target_hi: float = 0.635,
+    used_lut_counts: dict = None,
+    diversity_weight: float = 0.008,
 ) -> tuple[str, float, str]:
     """
-    Instead of blindly hard-locking LUT tiers without checking the video:
     1. Diagnoses the actual video's color & dynamic range state (`video_m`).
-    2. Simulates `Video × LUT` across all 1,636 LUTs in `lut_optical_db.json` over candidate intensities `alpha`.
-    3. Rejects any (LUT, alpha) pair that causes clipping, shadow crushing, tonal inversion, or unwanted B&W on THIS specific video.
-    4. Selects the (LUT, alpha) pair whose simulated post-LUT output lands closest to the 35mm Scene Target.
+    2. Computes the ideal 3D-LUT optical transfer profile `(ideal_blk, ideal_mid, ideal_hi, ideal_midRB, ideal_midGM, ideal_sat)`
+       needed at Stage 1 (`zorder: 2000`) to counter-balance `(video_m - target)` before Stage 2 (`zorder: 8004` Adjust).
+    3. Simulates `Video × LUT` across the verified Rec.709 cinematic LUT pool over candidate intensities `alpha`,
+       rejecting any (LUT, alpha) pair that causes clipping, shadow crushing, tonal inversion, or unwanted B&W.
+    4. Selects the optimal (LUT, alpha) pair with diversity regularization so distinct scenes & shot profiles
+       receive their exact matching LUT from the 83-LUT pool rather than collapsing onto 1-2 boundary LUTs.
     """
     v_state = diagnose_video_state(video_m)
     if not optical_db:
-        return fallback_lut, 0.25, v_state
+        return fallback_lut, 0.20, v_state
 
     is_mono_video = (v_state == "MONOCHROME_INPUT") or allow_bw
     min_allowed_sat = min(0.055, video_m.get("sat", 0.10) * 0.72)
 
+    p5 = video_m.get("p5", 0.05)
+    mid = video_m.get("mid", 0.28)
+    p95 = video_m.get("p95", 0.62)
+    rb = video_m.get("rb", 0.13)
+    gm = video_m.get("gm", -0.012)
+    sat = video_m.get("sat", 0.15)
+
+    d_rb = rb - target_rb
+    d_mid = mid - target_mid
+    d_p5 = p5 - target_p5
+    d_hi = p95 - target_hi
+    d_gm = gm - target_gm
+    d_sat = sat - target_sat
+
+    ideal_midRB = clamp(-d_rb * 1.15, -0.155, 0.062)
+    ideal_mid = clamp(0.272 - d_mid * 0.45, 0.205, 0.345)
+    ideal_blk = clamp(0.056 - d_p5 * 0.32, 0.024, 0.092)
+    ideal_hi = clamp(0.738 - d_hi * 0.35, 0.640, 0.805)
+    ideal_midGM = clamp(-d_gm * 0.80, -0.030, 0.030)
+    ideal_sat = clamp(0.95 - d_sat * 1.85, 0.72, 1.14)
+
     best_title = fallback_lut
-    best_alpha = 0.25
+    best_alpha = 0.20
     best_score = 1e9
 
-    candidate_alphas = (0.14, 0.16, 0.18, 0.20)
+    candidate_alphas = (0.14, 0.16, 0.18, 0.20, 0.22)
 
     cinematic_safe_prefixes = (
         "FILM LOOK", "CINEMATIC", "ATMOSPHERIC", "HOLLYWOOD",
         "MOOD", "SKINTONE", "SCC-REC709", "LUT ", "COMMERCIAL",
-        "THE ROMANCE", "DRONE", "BROWN AQUA"
+        "THE ROMANCE", "DRONE", "BROWN AQUA", "LANDSCAPE",
+        "DRAMATIC", "STUDIO", "CITY", "FOREST", "WARM", "HDR",
+        "WEDDING", "CW_WEDDING", "PRESETPRO"
     )
 
     for entry in optical_db:
-        if not is_mono_video and (entry.get("tier") == "bw_mono" or entry.get("satGain", 1.0) < 0.74 or entry.get("satGain", 1.0) > 1.06):
+        if not is_mono_video and (entry.get("tier") == "bw_mono" or entry.get("satGain", 1.0) < 0.70 or entry.get("satGain", 1.0) > 1.18):
             continue
-        # Never use camera_log LUTs, milky-black LUTs (blk > 0.090), or high-glare LUTs (hi > 0.765)
         if entry.get("tier") == "camera_log":
             continue
-        if entry.get("blk", 0.05) < 0.030 or entry.get("blk", 0.05) > 0.090:
+        if entry.get("blk", 0.05) < 0.020 or entry.get("blk", 0.05) > 0.102:
             continue
-        if entry.get("mid", 0.28) < 0.225 or entry.get("mid", 0.28) > 0.318:
+        if entry.get("mid", 0.28) < 0.200 or entry.get("mid", 0.28) > 0.360:
             continue
-        if entry.get("hi", 0.75) < 0.635 or entry.get("hi", 0.75) > 0.765:
+        if entry.get("hi", 0.75) < 0.605 or entry.get("hi", 0.75) > 0.825:
             continue
-        if abs(entry.get("hiRB", 0.0)) > 0.055 or abs(entry.get("hiGM", 0.0)) > 0.035:
+        if abs(entry.get("hiRB", 0.0)) > 0.10 or abs(entry.get("hiGM", 0.0)) > 0.055:
             continue
 
         t = entry["title"]
         t_up = t.upper()
         if not any(t_up.startswith(pfx) for pfx in cinematic_safe_prefixes):
             continue
-        if any(bad in t_up for bad in ("VINTAGE", "RETRO", "SEPIA", "OLD", "BW", "B&W", "MONO")):
+        if any(bad in t_up for bad in ("VINTAGE", "RETRO", "SEPIA", "OLD", "BW", "B&W", "MONO", "GAMMA3", "GAMMA4", "GAMMA 3")):
             continue
-        fam_bonus = -0.020 if any(k in t_up for k in preferred_families) else 0.0
+        fam_bonus = -0.012 if any(k in t_up for k in preferred_families) else 0.0
+        div_pen = min(0.052, used_lut_counts.get(t, 0) * diversity_weight) if used_lut_counts else 0.0
+
+        lut_transfer_err = (
+            abs(entry["midRB"] - ideal_midRB) * 3.2
+            + abs(entry["mid"] - ideal_mid) * 2.6
+            + abs(entry["blk"] - ideal_blk) * 2.0
+            + abs(entry["hi"] - ideal_hi) * 1.6
+            + abs(entry["midGM"] - ideal_midGM) * 1.5
+            + abs(entry["satGain"] - ideal_sat) * 1.4
+        )
 
         for alpha in candidate_alphas:
             sim = simulate_video_through_lut(video_m, entry, alpha)
             if not (sim["sim_p5"] < sim["sim_mid"] < sim["sim_hi"]):
                 continue
-            if sim["sim_p5"] < 0.012 or sim["sim_p5"] > max(0.115, video_m.get("p5", 0.05) + 0.008):
+            if sim["sim_p5"] < 0.010 or sim["sim_p5"] > max(0.125, p5 + 0.010):
                 continue
-            if sim["sim_hi"] > max(0.88, video_m.get("p95", 0.62) + 0.008) or sim["sim_hi"] < 0.42:
+            if sim["sim_hi"] > max(0.89, p95 + 0.012) or sim["sim_hi"] < 0.40:
                 continue
-            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > max(0.245, video_m.get("sat", 0.15) * 1.02)):
+            if not is_mono_video and (sim["sim_sat"] < min_allowed_sat or sim["sim_sat"] > max(0.255, sat * 1.06)):
                 continue
 
-            err_mid = abs(sim["sim_mid"] - target_mid) * 2.8
-            err_rb = abs(sim["sim_rb"] - target_rb) * 3.4
-            err_p5 = abs(sim["sim_p5"] - target_p5) * 2.4
-            err_hi = abs(sim["sim_hi"] - target_hi) * 1.5
-            err_gm = abs(sim["sim_gm"] - target_gm) * 2.0
-            err_sat = abs(sim["sim_sat"] - target_sat) * 1.8
-
-            score = err_mid + err_rb + err_p5 + err_hi + err_gm + err_sat + fam_bonus
+            sim_err = (
+                abs(sim["sim_mid"] - target_mid) * 0.45
+                + abs(sim["sim_rb"] - target_rb) * 0.55
+                + abs(sim["sim_p5"] - target_p5) * 0.35
+                + abs(sim["sim_hi"] - target_hi) * 0.25
+            )
+            score = lut_transfer_err + sim_err + fam_bonus + div_pen
             if score < best_score:
                 best_score = score
                 best_title = t
                 best_alpha = alpha
+
+    if used_lut_counts is not None:
+        used_lut_counts[best_title] = used_lut_counts.get(best_title, 0) + 1
 
     return best_title, best_alpha, v_state
 
@@ -413,6 +471,7 @@ def select_scene_primary_lut_and_targets(
     allow_bw: bool = False,
     bg_code: str = "",
     seedance_ref: dict = None,
+    used_primary_luts: dict = None,
 ) -> dict:
     p5 = anchor.get("p5", 0.05)
     mid = anchor.get("mid", 0.28)
@@ -475,42 +534,40 @@ def select_scene_primary_lut_and_targets(
         else:
             act_mood = emotion
 
-        target_p5 = 0.048
-        target_hi = 0.610
+        target_p5 = round(clamp(0.038 + 0.15 * min(p5, 0.12), 0.040, 0.056), 4)
+        target_hi = round(clamp(0.595 + 0.12 * (p95 - 0.55), 0.590, 0.640), 4)
         if mid <= 0.220:
             target_mid = 0.255
         elif mid <= 0.285:
-            # Evening/night/dark-suit interior scenes: keep target_mid grounded (0.260..0.280) so faces & windows never glare!
-            target_mid = clamp(mid, 0.260, 0.280)
+            # Evening/night/dark-suit interior scenes: keep target_mid grounded (0.258..0.282) so faces & windows never glare!
+            target_mid = round(clamp(0.258 + 0.35 * (mid - 0.220), 0.258, 0.282), 4)
         else:
-            # Daytime scenes: pull down glaring high-key midtones to a soft 35mm matte range (0.290..0.325)
-            target_mid = clamp(mid, 0.290, 0.325)
+            # Daytime/dawn/dusk scenes: proportional matte 35mm midtones (0.292..0.335)
+            target_mid = round(clamp(0.292 + 0.22 * (mid - 0.290), 0.292, 0.335), 4)
 
-        if rb > 0.155 and act_mood != "vintage-35mm":
-            target_rb = 0.120
-        elif rb < 0.090 and act_mood in ("warm-human", "vintage-35mm"):
-            target_rb = 0.090
-        else:
-            target_rb = clamp(rb, 0.045, 0.120)
+        target_rb = round(clamp(0.055 + 0.42 * (rb - 0.055), 0.045, 0.132), 4)
+        if act_mood in ("warm-human", "vintage-35mm") and target_rb < 0.088:
+            target_rb = 0.088
 
         target_gm = -0.010 if act_mood in ("warm-human", "vintage-35mm") else -0.008
-        target_sat = clamp(sat * 0.94, 0.095, 0.125)
+        target_sat = round(clamp(0.095 + 0.22 * (sat - 0.10), 0.095, 0.130), 4)
         use_vignette = False
 
         if act_mood == "warm-human":
-            fb_lut, fams = "THE ROMANCE 09.cube", ("SKINTONE", "THE ROMANCE", "ATMOSPHERIC", "SCC-REC709")
+            fb_lut, fams = "THE ROMANCE 09.cube", ("SKINTONE", "THE ROMANCE", "ATMOSPHERIC", "SCC-REC709", "WEDDING")
         elif act_mood == "climax-punch":
-            fb_lut, fams = "SCC-rec709 (27).cube", ("SCC-REC709", "SKINTONE", "ATMOSPHERIC", "FILM LOOK")
+            fb_lut, fams = "SCC-rec709 (27).cube", ("SCC-REC709", "SKINTONE", "ATMOSPHERIC", "FILM LOOK", "DRAMATIC")
         elif act_mood == "dramatic-contrast":
-            fb_lut, fams = "ATMOSPHERIC (35).cube", ("ATMOSPHERIC", "SKINTONE", "FILM LOOK", "SCC-REC709")
+            fb_lut, fams = "ATMOSPHERIC (35).cube", ("ATMOSPHERIC", "SKINTONE", "FILM LOOK", "SCC-REC709", "DRAMATIC")
         elif act_mood == "vintage-35mm":
-            fb_lut, fams = "SKINTONE (4).cube", ("SKINTONE", "ATMOSPHERIC", "THE ROMANCE")
+            fb_lut, fams = "SKINTONE (4).cube", ("SKINTONE", "ATMOSPHERIC", "THE ROMANCE", "FILM LOOK")
         else:
-            fb_lut, fams = "SKINTONE (9).cube", ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE")
+            fb_lut, fams = "SKINTONE (9).cube", ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE", "COMMERCIAL")
 
     lut, base_val, v_state = match_optimal_lut_by_video_simulation(
         optical_db, anchor, target_mid, target_rb, target_gm, target_sat, fams, fb_lut,
-        allow_bw=allow_bw, target_p5=target_p5, target_hi=target_hi
+        allow_bw=allow_bw, target_p5=target_p5, target_hi=target_hi,
+        used_lut_counts=used_primary_luts, diversity_weight=0.024
     )
     prof = f"[{act_mood} | {v_state}] Simulated Video×LUT Match"
 
@@ -580,6 +637,7 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
 
     # Compute unified anchor for each (regime, base_loc) group weighted by segment count
     group_cfgs = {}
+    used_primary_luts = {}
     for gkey, g_clusters in loc_groups.items():
         regime, base_loc = gkey
         keys = list(g_clusters[0]["anchor"].keys())
@@ -593,7 +651,8 @@ def assign_unified_scene_targets(clusters: list, emotion: str, optical_db: list[
         rep_bg = g_clusters[0]["bg_code"]
         cfg = select_scene_primary_lut_and_targets(
             weighted_anchor, emotion, avg_prog, optical_db=optical_db,
-            allow_bw=allow_bw, bg_code=rep_bg, seedance_ref=seedance_ref
+            allow_bw=allow_bw, bg_code=rep_bg, seedance_ref=seedance_ref,
+            used_primary_luts=used_primary_luts
         )
         group_cfgs[gkey] = (weighted_anchor, cfg)
 
@@ -611,11 +670,12 @@ def compute_shot_lut_and_adjustments(
     force_neighbor_match: bool = False,
     optical_db: list[dict] = None,
     seg_scale: float = 1.0,
+    used_shot_luts: dict = None,
 ) -> tuple[str, float, list, str]:
     """
     Closed-Loop Two-Stage Controller for Intra-Scene & Same-Location Continuity:
     - Stage 1 (zorder 2000): If a shot deviates from the unified Scene Target (`target_mid`, `target_rb`, `target_p5`),
-      searches the 1,636 LUT database for the optimal Counter-Balance Sibling LUT.
+      searches the 83-LUT verified Rec.709 database for the optimal Counter-Balance Sibling LUT.
     - Stage 2 (zorder 8004): Simulates the exact Post-LUT metrics `sim = simulate_video_through_lut(m, lut, val)`
       and computes all 12 Adjust sliders to cancel out the remaining Post-LUT residual (`sim - target`),
       plus adds a Scale-Aware Super-Resolution sharpness/clarity boost for zoomed clips (`scale` up to 1.50x)!
@@ -660,14 +720,17 @@ def compute_shot_lut_and_adjustments(
     eff_m = dict(m, rb=eff_in_rb, sat=eff_in_sat)
 
     # Stage 1 (zorder 2000): Trigger Counter-Balance Sibling LUT whenever shot deviates from Scene Target
-    if abs(d_mid_target) > 0.038 or abs(d_rb_target) > 0.028 or abs(d_p5_target) > 0.025 or skin_rb > 0.235 or skin_sat > 0.235:
+    if abs(d_mid_target) > 0.030 or abs(d_rb_target) > 0.022 or abs(d_p5_target) > 0.020 or skin_rb > 0.230 or skin_sat > 0.230:
         fb = "FILM LOOK (18).cube" if (d_rb_target > 0.028 or skin_rb > 0.235) else ("SCC-rec709 (27).cube" if d_mid_target < -0.038 else "DRONE (19).cube")
         lut_title, base_val, shot_state = match_optimal_lut_by_video_simulation(
             optical_db, eff_m, target_mid, target_rb, target_gm, target_sat,
-            ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE", "FILM LOOK", "DRONE"),
-            fb, target_p5=target_p5, target_hi=target_hi
+            ("SKINTONE", "ATMOSPHERIC", "SCC-REC709", "THE ROMANCE", "FILM LOOK", "DRONE", "DRAMATIC", "MOOD", "COMMERCIAL", "WEDDING"),
+            fb, target_p5=target_p5, target_hi=target_hi,
+            used_lut_counts=used_shot_luts, diversity_weight=0.007
         )
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Simulated: {shot_state}]"
+    elif used_shot_luts is not None:
+        used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
     lut_val = round(base_val + clamp((target_mid - mid) * 0.04, -0.010, 0.010), 3)
 
@@ -1193,6 +1256,7 @@ def main():
     total_adjusts = 0
     angle_jump_fixes = 0
     zoomed_count = 0
+    used_shot_luts = {}
     for idx, (d_obj, seg, _, _) in enumerate(all_seg_tuples):
         effects = d_obj["materials"].setdefault("effects", [])
         seg["extra_material_refs"] = [r for r in seg.get("extra_material_refs", []) if r not in old_eff_ids]
@@ -1224,7 +1288,8 @@ def main():
                 and (abs(m["rb"] - scene_anchor["rb"]) > 0.035 or abs(m["mid"] - scene_anchor["mid"]) > 0.045)
             )
             lut_title, val, adj_list, prof = compute_shot_lut_and_adjustments(
-                m, scene_cfg, scene_anchor, local_nb_m, force_nb, optical_db=optical_db, seg_scale=seg_scale
+                m, scene_cfg, scene_anchor, local_nb_m, force_nb, optical_db=optical_db, seg_scale=seg_scale,
+                used_shot_luts=used_shot_luts
             )
             if "Angle-Jump" in prof:
                 angle_jump_fixes += 1
