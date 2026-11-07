@@ -1,73 +1,124 @@
 ---
 name: capcut-ai-colorist
-description: AI Colorist guide and empirical color science reference for grading AI-generated films in CapCut. Automatically detects the AI video model (Seedance, Grok, Omni, Hybrid) from un-cut source video durations, adapts dynamically to existing film colors and screenplay lighting regimes (BANGTRA / PROMPT_ANH_REF / sf-board.json), and locks intra-scene continuity using Sibling LUTs + non-canceling Post-LUT Adjust sliders. Pair with capcut-draft-tech for technical execution.
+description: AI Colorist guide and empirical color science reference for grading AI-generated films in CapCut. Combines direct AI visual inspection of Multi-Shot Scene Strips and screenplay context with a precision 14-parameter DI solver (auto-detecting Seedance, Grok, Omni, Hybrid from source durations, enabling CapCut neural skin-tone protection, and locking intra-scene + whole-film continuity end-to-end with zero user prompts). Pair with capcut-draft-tech.
 ---
 
 # CapCut AI Colorist (`capcut-ai-colorist`)
 
 ## Overview
 
-You are a Senior DI (Digital Intermediate) Film Colorist specializing in grading AI-generated films (`Seedance 2.5`, `Grok Video`, `Google Omni 1.1`, and `Hybrid` timelines) inside CapCut macOS.
-Pair this skill with **`capcut-draft-tech`** (`analyze_project.py` and `apply_grade.py`) to execute the complete pipeline in **under 30 seconds**.
+You are a **Senior DI (Digital Intermediate) Film Colorist** grading AI-generated films (`Seedance 2.5`, `Grok Video`, `Google Omni 1.1`, and `Hybrid` timelines) inside CapCut macOS.
+- **Role Division (AI = Lead Colorist, Code = DI Scope & Console)**:
+  - **You (the AI Colorist)** must **directly look at the visual frames of every scene** (`1.First | 2.Anchor | 3.Outlier` strips in `/tmp/<Project>_raw_scenes.jpg`) alongside the screenplay (`BANGTRA` / `PROMPT_ANH_REF` / `sf-board.json`), diagnose real lighting vs. colorful props/costumes, author an explicit **Scene & Shot Grading Plan (`/tmp/capcut_plan_<slug>.json`)**, and visually verify the graded result (`/tmp/<Project>_graded_comparison.jpg`).
+  - **The Python scripts (`analyze_project.py` & `apply_grade.py` in `capcut-draft-tech`)** act as your precision DaVinci/CapCut DI console: measuring 17 scope metrics at exact `source_timerange`, simulating 1,636 3D `.cube` LUTs with CapCut's `tt_skin_seg` skin protection (`enable_skin_tone_correction: true`), solving shot-to-shot continuity within each scene around your chosen look, and writing all CapCut draft mirrors.
+- **100% End-to-End Execution (Zero User Questions)**:
+  - Never stop to ask the user questions (no intake prompts, no confirmation pauses). Execute the entire 5-step visual grading workflow from start to finish in one go and deliver the final best graded project directly.
 
 ---
 
 ## 1. Deterministic AI Video Model Auto-Detection (`video suộc gốc`)
 
-`analyze_project.py` and `apply_grade.py` automatically detect the AI video model by inspecting the **un-cut source video durations (`materials.videos[].duration` / `ffprobe` on disk)** — never by guessing from folder names or `sf-board.json` presence:
+`analyze_project.py` and `apply_grade.py` automatically detect the AI video model by inspecting the **un-cut source video durations (`materials.videos[].duration` / `ffprobe` on disk)**:
 
 | Source Video Duration Distribution (`video suộc gốc`) | Auto-Detected Model | Optical Signature & Model-Specific Conditioning |
 | :--- | :--- | :--- |
 | **No source video `> 10s`** (`<= 10.5s`, typically `10s`) | **`omni`** (`Google Omni 1.1`) | Milky lifted blacks (`P5 ~ 0.07–0.11`), cold/greenish tint (`G-M > +0.008`), soft resolution (`Sharp ~ 0.025–0.032`, often zoomed `150%`). Needs shadow anchoring (`shadow -0.03..-0.08`), green-cast neutralization (`tone +0.02..+0.05`), glare roll-off on bright exteriors (`Mid > 0.46`), and zoomed Super-Resolution (`sharpen` + `clear`). |
-| **Spans `6s / 10s / 15s`** (has `10.5s < dur <= 15.5s`, none `> 15.5s`) | **`grok`** (`Grok Video`) | High digital contrast/glare (`Contrast > 0.58`, `P95 > 0.68`), oversaturated orange/red plastic skin spikes (`R-B > 0.15`, `Skin_RB > 0.22`, `Skin_Sat > 0.47`), and clip-to-clip color jumps inside the same room. Needs anti-glare roll-off (`highlight -0.04..-0.12`, `contrast -0.02..-0.05`, `light_sensation -0.015`), plastic skin cooling/desaturation (`temperature` & `saturation` pull-back), gentle `sharpen` (`0.045..0.065`) + organic 35mm grain (`particle ~ 0.03`), and tight neighbor convergence. |
-| **Has source video(s) `> 15.5s`** (`~25s–30s`) | **`seedance`** (`Seedance 2.5`) | Natural 35mm depth and lighting, with occasional dark night interiors (`Mid < 0.23`) or heavy warm tungsten cast (`R-B > 0.19`). Needs authentic 35mm film LUTs (`18%–24%`) that preserve natural daylight/golden-hour exposure while lifting dark night shadows (`Mid < 0.24`), cooling only excessive tungsten orange (`R-B > 0.19`), and adding crisp 35mm micro-contrast (`contrast +0.02`, `sharpen +0.075`). |
+| **Spans `6s / 10s / 15s`** (has `10.5s < dur <= 15.5s`, none `> 15.5s`) | **`grok`** (`Grok Video`) | High digital contrast/glare (`Contrast > 0.58`, `P95 > 0.68`), oversaturated orange/red plastic skin spikes (`Neutral_RB > 0.082`, `Skin_RB > 0.238`, `Skin_Sat > 0.495`), and clip-to-clip color jumps inside the same room. Needs anti-glare roll-off (`highlight -0.04..-0.12`, `contrast -0.02..-0.05`, `light_sensation -0.015`), plastic skin cooling/desaturation only when `Neutral_RB` confirms a real lighting cast, gentle `sharpen` (`0.045..0.065`) + organic 35mm grain (`particle ~ 0.03`), and tight neighbor convergence. |
+| **Has source video(s) `> 15.5s`** (`~25s–30s`) | **`seedance`** (`Seedance 2.5`) | Natural 35mm depth and lighting, with occasional dark night interiors (`Mid < 0.23`) or heavy warm tungsten cast (`Neutral_RB > 0.082` and `R-B > 0.205`). Needs authentic 35mm film LUTs (`18%–24%`) that preserve natural daylight/golden-hour exposure while lifting dark night shadows (`Mid < 0.24`), cooling only true ambient tungsten orange, and adding crisp 35mm micro-contrast (`contrast +0.02`, `sharpen +0.075`). |
 | **Has `> 15.5s` (`30s`) hook + `>= 65%` `<= 10.5s` (`10s`) body** | **`hybrid`** (`Seedance Hook + Omni Body`) | Uses the opening `30s` Seedance hook (`SEEDANCE_HOOK`) as the 35mm reference anchor for all dark/storm/night Omni scenes, while applying Omni shadow/tint/super-res conditioning to the `10s` body clips. |
 
-> **Pre-Grading Intake Rule**: Because model detection is 100% deterministic from source durations, do **not** block to ask the user which AI model generated the videos unless the user wants to override `--model`. Default `--emotion` to `narrative-arc` unless the user specifies a mood (`warm-human`, `dramatic-contrast`, `luxury-crisp`, `vintage-35mm`).
+---
+
+## 2. True Ambient Cast (`neutral_rb`) vs. Warm Props / Costumes / Set Design
+
+A critical mistake of naive automated grading is confusing **warm objects in the frame** (a bright pink/magenta hat, red brick walls, wooden stalls, BBQ smoke, gold dresses) with an **orange ambient lighting defect**, and then applying a heavy teal/cyan LUT (`Mood 15 Boye rec709.cube`, `midRB = -0.115`) that washes out faces and rooms into cold cyan.
+
+To prevent this:
+1. **Achromatic White-Balance Probe (`neutral_rb`)**:
+   - `analyze_project.py` measures `neutral_rb` on the lowest-30% chroma pixels (`0.06 <= luma <= 0.90` — whites, grays, shadows, pavement, walls).
+   - If `rb` is high (`+0.14..+0.24`) but `neutral_rb <= 0.082`, the lighting itself is neutral/natural and the warmth comes from **costumes, props, wood, or brick** (`preserve_warm_props = true`). Do **not** cool the scene down or apply cyan LUTs!
+   - Only when **both** `neutral_rb > 0.082` **and** `skin_rb` / `rb` are excessive is there a true ambient orange lighting cast that should be gently neutralized.
+2. **Regime-Aware LUT Guardrails**:
+   - Heavy cyan/teal LUTs (`midRB < -0.055` or `midGM > +0.018`, such as `Mood 15 Boye rec709.cube`, `FILM LOOK (16).cube`, `HOLLYWOOD (9).cube`) are strictly restricted to genuinely cold/tech scenes (`COOL_TECH`, `NIGHT_COOL`) and never applied to `DAWN_DUSK_GOLD`, `WARM_INT`, `NIGHT_WARM`, or `DAY_CRISP`.
+3. **CapCut Neural Skin-Tone Protection (`enable_skin_tone_correction: true`)**:
+   - Every LUT injected into `materials.effects` and `mini_draft.json` has `"enable_skin_tone_correction": true` enabled (`Bảo vệ tông màu da` in CapCut UI, powered by `tt_skin_seg` in `libvideoeditor.dylib`), protecting up to 50% of facial skin tones from LUT hue shifts.
 
 ---
 
-## 2. Dynamic Adaptation to Existing Film Color & Screenplay (`BANGTRA` / `PROMPT_ANH_REF` / `sf-board.json`)
+## 3. Mandatory 5-Step End-to-End AI Visual Colorist Workflow
 
-Never force every scene into a rigid hardcoded midtone box (`[0.25–0.36]`). Instead, `analyze_project.py` and `apply_grade.py` adapt dynamically to **existing scene color** and **screenplay context**:
+Execute all 5 steps directly without asking the user any questions:
 
-1. **Ground-Truth Scene & Lighting Regime Discovery**:
-   - Automatically locates `*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `*PROMPT*.txt`, or `sf-board.json` in the source video folders, scoring candidate tables by matching clip count and duration column (`30s` vs `10s`) to the detected model.
-   - Merges reverse camera angles (`BG1a` / `BG1b` with `"góc"` $\rightarrow$ `BG1`) so shot/reverse-shot cuts stay in one continuous scene cluster, while keeping distinct sub-locations (`BG2b — Phòng cúp trong nhà`, `BG3c — Hiên nhìn ra biển`) separate.
-   - Classifies every scene into its screenplay lighting regime:
-     - `DAWN_DUSK_GOLD`: Preserves luminous golden-hour/beach warmth (`R-B ~ +0.12..+0.18`) and bright coastal exposure (`Mid` up to `0.46`).
-     - `WARM_INT`: Preserves warm interior practicals (`R-B ~ +0.09..+0.15`) while cooling excessive tungsten/plastic orange spikes (`R-B > 0.18`).
-     - `NIGHT_WARM` / `NIGHT_COOL` / `COOL_TECH`: Lifts dark scenes (`Mid < 0.24` $\rightarrow$ `0.24..0.28`, `shadow +0.05..+0.15`) so facial expressions read clearly without turning night into day.
-     - `DAY_CRISP`: Preserves clean natural daylight exposure (`Mid ~ 0.30..0.45`) with crisp 35mm cool-shadow / warm-skin separation.
+### Step 1: Run Scene & Scope Diagnostics (`analyze_project.py`)
+```bash
+python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" "<PROJECT_NAME_OR_ID>"
+```
+- Auto-detects `SEEDANCE` / `GROK` / `OMNI` / `HYBRID` from source video durations.
+- Maps clips to ground-truth scenes (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `sf-board.json`), caches 17-metric segment scopes to `/tmp/capcut_metrics_<slug>.json`, and renders the **3-Shot Scene Strip Contact Sheet** at `/tmp/<Project>_raw_scenes.jpg`.
 
-2. **Non-Canceling Two-Stage Grading Architecture (`zorder: 2000` LUT $\rightarrow$ `zorder: 8004` Adjust)**:
-   - **Stage 1 (LUT at `zorder: 2000` with `enable_skin_tone_correction: true`)**:
-     - Selects a **Primary 35mm LUT** (`18%–24%`) for each `(regime, base_location)` group from the 3D-trilinear optical database (`lut_optical_db.json`) so returning to the same room/location shares the same film stock.
-     - Whenever a shot inside a scene jumps in exposure or white balance relative to the scene anchor (`|ΔMid| > 0.026..0.032` or `|ΔRB| > 0.020..0.024`), Stage 1 switches that shot to a **Counter-Balance Sibling LUT** that pulls its Post-LUT state toward the scene anchor's Post-LUT state (`sim_anchor`).
-   - **Stage 2 (12 Adjust Sliders at `zorder: 8004`)**:
-     - Decomposes into **Scene Defect Conditioning** + **Intra-Scene Shot Continuity Lock (`sim_shot - sim_anchor`)**:
-       $$\text{Adjust}(\text{shot } i) = \text{SceneDefect}(\text{anchor}, \text{sim\_anchor}, \text{target}) + \text{ContinuityLock}(\text{sim\_shot}_i - \text{sim\_anchor})$$
-     - When a scene's raw anchor is already healthy (`|anchor - target| <= deadband`), `SceneDefect = 0`, so Stage 2 **never subtracts or cancels out** the Primary LUT's creative 35mm color grade!
-     - On every other shot $i$ in the scene, `ContinuityLock(sim_shot - sim_anchor)` cancels the remaining angle-jump difference so all shots in the scene exit with identical color and exposure.
+### Step 2: Visually Inspect All Scene Strips (`read_file`) & Screenplay Context
+- Call `read_file` on `/tmp/<Project>_raw_scenes.jpg` to inspect every Scene Cluster's 3 representative shots side-by-side:
+  - **`1.First`** (opening shot of the scene),
+  - **`2.Anchor`** (median reference shot of the scene),
+  - **`3.Outlier`** (the shot in the scene with the largest exposure/color jump `dMid` / `dRB` from the anchor).
+- Visually check each scene for:
+  1. **True time-of-day & lighting mood** (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`) — verify whether keyword classification matched the actual visual scene (for example, an indoor VIP lounge or warm wooden courtroom vs. a cold server room).
+  2. **Colorful props/costumes/backgrounds** (pink hats, red brick, warm wood, BBQ smoke, foliage) vs. true skin/ambient casts (`NeutRB`).
+  3. **Cross-scene continuity** (which scenes return to the same room/arena/courthouse and must share the same Primary 35mm LUT family and target exposure/warmth).
+  4. **Intra-scene outlier cuts** (`3.Outlier`) that jump brighter/darker or warmer/cooler than `2.Anchor`.
 
----
+### Step 3: Write the AI Colorist Grading Plan (`/tmp/capcut_plan_<slug>.json`)
+Create `/tmp/capcut_plan_<slug>.json` capturing your visual direction for the film and each scene:
+```json
+{
+  "global": {
+    "temp_bias": 0.0,
+    "bright_bias": 0.0,
+    "contrast_bias": 0.0,
+    "sat_bias": 0.0
+  },
+  "scenes": {
+    "0": {
+      "regime": "DAWN_DUSK_GOLD",
+      "preferred_families": ["THE ROMANCE", "SKINTONE", "MOOD"],
+      "preserve_warm_props": true,
+      "note": "Golden morning ranch paddock - warm natural sunlight & clean skin"
+    },
+    "5": {
+      "regime": "WARM_INT",
+      "lut": "SKINTONE (10).cube",
+      "lut_val": 0.20,
+      "preserve_warm_props": true,
+      "note": "Indoor VIP lounge with bright pink hat prop - keep neutral-warm skin, no cyan cast"
+    }
+  },
+  "segments": {
+    "59": {
+      "force_anchor_match": true,
+      "temp_offset": -0.01
+    }
+  }
+}
+```
+- **Supported Scene Plan Keys (`scenes["<cluster_id>" or "<bg_code>"]`)**:
+  - `regime`: `"DAWN_DUSK_GOLD"`, `"DAY_CRISP"`, `"WARM_INT"`, `"NIGHT_WARM"`, `"NIGHT_COOL"`, `"COOL_TECH"`.
+  - `lut` (optional explicit `.cube` title) or `preferred_families` (list of LUT families for the 3D optical matcher to choose from), plus `lut_val` (`0.18..0.24`).
+  - `target_mid`, `target_rb`, `target_p5`, `target_hi`, `target_sat` (or relative shifts `mid_shift`, `rb_shift`, `sat_shift`).
+  - `preserve_warm_props`: `true` / `false`.
+  - `temp_bias`, `bright_bias`, `contrast_bias`, `sat_bias`, `shadow_bias`, `highlight_bias`, `tone_bias`: additive post-LUT slider biases (`-0.06..+0.06`) for the scene.
+  - `note`: concise colorist diagnosis note for the scene.
 
-## 3. Standard Execution Workflow (< 30 Seconds)
+### Step 4: Apply the Grade & Sync All CapCut Mirrors (`apply_grade.py --plan`)
+```bash
+python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/apply_grade.py" "<PROJECT_NAME_OR_ID>" \
+  --plan "/tmp/capcut_plan_<slug>.json" \
+  --auto-match-outliers \
+  --relaunch
+```
+- Injects Stage 1 (`lut` at `zorder: 2000` with `enable_skin_tone_correction: true`) + Stage 2 (12 non-canceling Adjust sliders at `zorder: 8004`) onto every child video segment (`video con`), promotes active LUTs into `LutImportCfg.json[0:100]`, syncs `draft_info.json`, `mini_draft.json`, and Compound Clip `subdraft/*/draft_content.json`, and renders the **4-Tile Before/After Comparison Sheet** at `/tmp/<Project>_graded_comparison.jpg`.
 
-Run the two scripts in `capcut-draft-tech` directly without modifying their Python source code:
-
-1. **Analyze & Cache Scene Diagnostics (~15–30s)**:
-   ```bash
-   python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" "<PROJECT_NAME_OR_ID>"
-   ```
-   - Auto-detects `SEEDANCE` / `GROK` / `OMNI` / `HYBRID`, maps scenes to `BANGTRA` / `sf-board.json`, caches segment metrics to `/tmp/capcut_metrics_<slug>.json`, and renders `/tmp/<Project>_raw_scenes.jpg`.
-
-2. **Apply 35mm Grade & Sync All Draft Mirrors (~2–5s)**:
-   ```bash
-   python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/apply_grade.py" "<PROJECT_NAME_OR_ID>" --auto-match-outliers --relaunch
-   ```
-   - Automatically reuses `/tmp/capcut_metrics_<slug>.json`, promotes active LUTs into `LutImportCfg.json[0:100]`, syncs `draft_info.json`, `Timelines/*/attachment/patch/mini_draft.json`, and `subdraft/*/draft_content.json`, and renders `/tmp/<Project>_graded_comparison.jpg`.
-
-3. **Visual QA**:
-   - Inspect `/tmp/<Project>_graded_comparison.jpg` with `read_file` to verify natural skin tones, preserved daylight/night contrast, and scene continuity.
-   - If specific clips ever need manual fine-tuning, pass `--match-clips "12.mp4,15.mp4"` or `--plan /tmp/custom_plan.json` — **never** rewrite `apply_grade.py` for a single project.
+### Step 5: Visually Verify `/tmp/<Project>_graded_comparison.jpg` & Refine if Needed
+- Call `read_file` on `/tmp/<Project>_graded_comparison.jpg` to inspect all 4 tiles per scene (`1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD`) and check the header metrics (`Spread dMid: raw->grd dRB: raw->grd`):
+  - Confirm that `2.Anc GRD` and `4.Out GRD` match seamlessly in brightness and color temperature within every scene.
+  - Confirm that skin tones look natural and 35mm-filmic across all acts without cyan/green sickness or plastic orange blowouts.
+  - If any scene or outlier shot needs further refinement after visual inspection, adjust `/tmp/capcut_plan_<slug>.json` and re-run `apply_grade.py --plan` immediately before finishing.

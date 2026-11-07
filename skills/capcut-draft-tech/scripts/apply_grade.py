@@ -343,6 +343,7 @@ def match_optimal_lut_by_video_simulation(
     used_lut_counts: dict = None,
     diversity_weight: float = 0.012,
     is_primary: bool = True,
+    regime: str = "DAY_CRISP",
 ) -> tuple[str, float, str]:
     """
     Selects the optimal (LUT, alpha) pair from the 3D-trilinear optical LUT database:
@@ -350,6 +351,8 @@ def match_optimal_lut_by_video_simulation(
       authentic 35mm contrast separation (`hi - blk >= 0.68`) so the LUT imparts a real cinema look.
     - For Intra-Scene Counter-Balance Sibling LUTs (`is_primary=False`), evaluates `alpha in (0.15, 0.18, 0.21, 0.24)`
       to pull an angle-jump shot's Post-LUT state directly toward the Scene Anchor's Post-LUT state.
+    - Enforces regime-aware color guardrails so heavy cyan/teal LUTs (`midRB < -0.055` or `midGM > +0.018`)
+      are never applied to warm or neutral-daylight scenes.
     """
     v_state = diagnose_video_state(video_m)
     if not optical_db:
@@ -376,6 +379,9 @@ def match_optimal_lut_by_video_simulation(
     if is_mono_video:
         allowed_tiers.add("bw_mono")
 
+    allow_heavy_teal = regime in ("COOL_TECH", "NIGHT_COOL")
+    is_warm_regime = regime in ("DAWN_DUSK_GOLD", "WARM_INT")
+
     for entry in optical_db:
         tier = entry.get("tier", "")
         if tier not in allowed_tiers:
@@ -387,6 +393,14 @@ def match_optimal_lut_by_video_simulation(
         if entry.get("mid", 0.28) < 0.220 or entry.get("mid", 0.28) > 0.355:
             continue
         if abs(entry.get("hiRB", 0.0)) > 0.085 or abs(entry.get("hiGM", 0.0)) > 0.055:
+            continue
+
+        # Regime-aware LUT tint guardrails: prevent cyan/teal LUTs from washing out warm/daylight scenes
+        mid_rb_lut = entry.get("midRB", 0.0)
+        mid_gm_lut = entry.get("midGM", 0.0)
+        if not allow_heavy_teal and (mid_rb_lut < -0.055 or mid_gm_lut > 0.018):
+            continue
+        if is_warm_regime and mid_rb_lut < -0.038:
             continue
 
         t = entry["title"]
@@ -539,32 +553,38 @@ def select_scene_primary_lut_and_targets(
             target_hi = clamp(p95, 0.615, 0.750)
 
         # 4. Dynamic Color & Saturation Targets by Script Lighting Regime + Model Defect Profile
+        # Use achromatic white-balance (`neutral_rb`) alongside `skin_rb` so colorful props/hats/brick walls
+        # (`neutral_rb <= 0.082`) are never misclassified as an ambient orange lighting cast.
+        neutral_rb = anchor.get("neutral_rb", rb * 0.45)
         is_hot_orange_defect = (
-            (project_model == "grok" and (rb > 0.152 or skin_rb > 0.222 or skin_sat > 0.475))
-            or (project_model != "grok" and (rb > 0.190 or skin_rb > 0.255))
+            neutral_rb > 0.082
+            and (
+                (project_model == "grok" and (rb > 0.172 or skin_rb > 0.238 or skin_sat > 0.495))
+                or (project_model != "grok" and (rb > 0.205 or skin_rb > 0.265))
+            )
         )
 
         if regime == "DAWN_DUSK_GOLD":
             if is_hot_orange_defect:
-                target_rb = clamp(rb - 0.038, 0.125, 0.165) if project_model == "grok" else clamp(rb - 0.030, 0.145, 0.180)
-                desired_lut_rb = -0.015
+                target_rb = clamp(rb - 0.032, 0.130, 0.170) if project_model == "grok" else clamp(rb - 0.025, 0.145, 0.180)
+                desired_lut_rb = -0.010
             else:
-                target_rb = clamp(rb + 0.008, 0.115, 0.185)
+                target_rb = clamp(rb + 0.008, 0.115, 0.195)
                 desired_lut_rb = +0.014
             target_gm = -0.012
-            target_sat = clamp(sat * (0.94 if is_hot_orange_defect else 1.03), 0.110, 0.185)
+            target_sat = clamp(sat * (0.95 if is_hot_orange_defect else 1.03), 0.110, 0.190)
             fb_lut = "THE ROMANCE 05.cube" if desired_lut_rb > 0 else "SKINTONE (10).cube"
             fams = ("THE ROMANCE", "MOOD", "SKINTONE", "LUT ", "FILM LOOK")
 
         elif regime == "WARM_INT":
             if is_hot_orange_defect:
-                target_rb = clamp(rb - 0.042, 0.105, 0.142) if project_model == "grok" else clamp(rb - 0.032, 0.125, 0.160)
-                desired_lut_rb = -0.020
+                target_rb = clamp(rb - 0.035, 0.115, 0.155) if project_model == "grok" else clamp(rb - 0.028, 0.125, 0.165)
+                desired_lut_rb = -0.012
             else:
-                target_rb = clamp(rb + 0.005, 0.085, 0.150)
+                target_rb = clamp(rb + 0.005, 0.085, 0.180)
                 desired_lut_rb = +0.008
             target_gm = -0.010
-            target_sat = clamp(sat * (0.92 if is_hot_orange_defect else 1.02), 0.100, 0.165)
+            target_sat = clamp(sat * (0.94 if is_hot_orange_defect else 1.02), 0.100, 0.175)
             fb_lut = "SKINTONE (10).cube"
             fams = ("SKINTONE", "MOOD", "LUT ", "CINEMATIC", "FILM LOOK")
 
@@ -576,40 +596,40 @@ def select_scene_primary_lut_and_targets(
                 fb_lut = "ATMOSPHERIC (12).cube"
                 fams = ("ATMOSPHERIC", "CINEMATIC", "FILM LOOK", "SKINTONE")
             elif is_hot_orange_defect:
-                target_rb = clamp(rb - 0.045, 0.110, 0.148) if project_model == "grok" else clamp(rb - 0.035, 0.130, 0.165)
-                desired_lut_rb = -0.022
+                target_rb = clamp(rb - 0.036, 0.115, 0.158) if project_model == "grok" else clamp(rb - 0.028, 0.130, 0.170)
+                desired_lut_rb = -0.014
                 fb_lut = "CINEMATIC  (27).cube"
                 fams = ("CINEMATIC", "SKINTONE", "FILM LOOK", "ATMOSPHERIC", "MOOD")
             else:
-                target_rb = clamp(rb, 0.075, 0.160)
-                desired_lut_rb = -0.006
+                target_rb = clamp(rb, 0.075, 0.185)
+                desired_lut_rb = -0.005
                 fb_lut = "ATMOSPHERIC (12).cube"
                 fams = ("ATMOSPHERIC", "CINEMATIC", "SKINTONE", "FILM LOOK", "MOOD")
             target_gm = -0.010
-            target_sat = clamp(sat * (0.92 if is_hot_orange_defect else 1.01), 0.095, 0.165)
+            target_sat = clamp(sat * (0.94 if is_hot_orange_defect else 1.01), 0.095, 0.175)
 
         elif regime in ("NIGHT_COOL", "COOL_TECH"):
-            target_rb = clamp(rb, -0.015, 0.065)
+            target_rb = clamp(rb, -0.015, 0.075)
             desired_lut_rb = -0.018
             target_gm = -0.006
-            target_sat = clamp(sat * 0.98, 0.080, 0.135)
+            target_sat = clamp(sat * 0.98, 0.080, 0.145)
             fb_lut = "DRAMATIC (14).cube"
             fams = ("DRAMATIC", "CINEMATIC", "FILM LOOK", "ATMOSPHERIC", "SCC-REC709")
 
         else:
-            # DAY_CRISP (Daylight Office, Street, Hangar, Courthouse, Beach Day)
+            # DAY_CRISP (Daylight Office, Street, Hangar, Courthouse, Beach Day, Outdoor Event)
             if is_hot_orange_defect:
-                target_rb = clamp(rb - 0.038, 0.095, 0.130) if project_model == "grok" else clamp(rb - 0.028, 0.110, 0.145)
-                desired_lut_rb = -0.020
+                target_rb = clamp(rb - 0.032, 0.105, 0.145) if project_model == "grok" else clamp(rb - 0.024, 0.115, 0.155)
+                desired_lut_rb = -0.014
             elif rb < 0.035:
                 # Cold/cyan Omni daylight -> warm subtly toward clean neutral daylight
                 target_rb = clamp(rb + 0.022, 0.035, 0.075)
                 desired_lut_rb = +0.010
             else:
                 target_rb = rb
-                desired_lut_rb = -0.008
+                desired_lut_rb = -0.006
             target_gm = -0.008
-            target_sat = clamp(sat * (0.93 if is_hot_orange_defect else 1.03), 0.090, 0.155)
+            target_sat = clamp(sat * (0.94 if is_hot_orange_defect else 1.03), 0.090, 0.165)
             fb_lut = "FILM LOOK (4).cube" if desired_lut_rb < 0 else "SKINTONE (10).cube"
             fams = ("FILM LOOK", "SCC-REC709", "SKINTONE", "LUT ", "COMMERCIAL", "CINEMATIC")
 
@@ -625,6 +645,7 @@ def select_scene_primary_lut_and_targets(
         allow_bw=use_bw, allow_stylized=allow_stylized,
         target_p5=lut_target_p5, target_hi=lut_target_hi,
         used_lut_counts=used_primary_luts, diversity_weight=0.016, is_primary=True,
+        regime=regime,
     )
 
     lut_entry = next((e for e in (optical_db or []) if e["title"] == lut), None)
@@ -654,7 +675,88 @@ def select_scene_primary_lut_and_targets(
         "target_sat": round(target_sat, 4),
         "sim_anchor": sim_anchor,
         "use_vignette": use_vignette,
+        "preserve_warm_props": bool(neutral_rb <= 0.082 and rb >= 0.130),
+        "temp_bias": 0.0,
+        "bright_bias": 0.0,
+        "contrast_bias": 0.0,
+        "sat_bias": 0.0,
+        "shadow_bias": 0.0,
+        "highlight_bias": 0.0,
+        "tone_bias": 0.0,
+        "ai_note": "",
     }
+
+
+def _apply_ai_scene_plan_override(cfg: dict, scene_anchor: dict, sc_plan: dict, global_plan: dict, optical_db: list[dict]):
+    """Applies the AI Colorist's explicit scene-level direction (`sc_plan` + `global_plan`) onto `cfg`."""
+    if not sc_plan and not global_plan:
+        return
+    sc_plan = sc_plan or {}
+    global_plan = global_plan or {}
+
+    if "regime" in sc_plan and sc_plan["regime"]:
+        cfg["regime"] = sc_plan["regime"]
+    if "target_p5" in sc_plan:
+        cfg["target_p5"] = round(float(sc_plan["target_p5"]), 4)
+    if "target_mid" in sc_plan:
+        cfg["target_mid"] = round(float(sc_plan["target_mid"]), 4)
+    elif "mid_shift" in sc_plan:
+        cfg["target_mid"] = round(clamp(cfg["target_mid"] + float(sc_plan["mid_shift"]), 0.18, 0.52), 4)
+    if "target_hi" in sc_plan:
+        cfg["target_hi"] = round(float(sc_plan["target_hi"]), 4)
+    if "target_rb" in sc_plan:
+        cfg["target_rb"] = round(float(sc_plan["target_rb"]), 4)
+    elif "rb_shift" in sc_plan:
+        cfg["target_rb"] = round(clamp(cfg["target_rb"] + float(sc_plan["rb_shift"]), -0.05, 0.25), 4)
+    if "target_gm" in sc_plan:
+        cfg["target_gm"] = round(float(sc_plan["target_gm"]), 4)
+    if "target_sat" in sc_plan:
+        cfg["target_sat"] = round(float(sc_plan["target_sat"]), 4)
+    elif "sat_shift" in sc_plan:
+        cfg["target_sat"] = round(clamp(cfg["target_sat"] + float(sc_plan["sat_shift"]), 0.05, 0.25), 4)
+
+    if "preserve_warm_props" in sc_plan:
+        cfg["preserve_warm_props"] = bool(sc_plan["preserve_warm_props"])
+    if "use_vignette" in sc_plan:
+        cfg["use_vignette"] = bool(sc_plan["use_vignette"])
+
+    # If the AI Colorist specified preferred_families (without hardcoding a LUT), re-run optical LUT simulation
+    if "preferred_families" in sc_plan and "lut" not in sc_plan:
+        fams = tuple(str(x).upper() for x in sc_plan["preferred_families"])
+        lut, base_val, _ = match_optimal_lut_by_video_simulation(
+            optical_db, scene_anchor, cfg["target_mid"], cfg["target_rb"], cfg["target_gm"], cfg["target_sat"],
+            fams, cfg["lut"], target_p5=cfg["target_p5"], target_hi=cfg["target_hi"],
+            is_primary=True, regime=cfg["regime"],
+        )
+        cfg["lut"] = lut
+        cfg["base_val"] = base_val
+
+    if "lut" in sc_plan and sc_plan["lut"]:
+        if isinstance(sc_plan["lut"], (list, tuple)) and len(sc_plan["lut"]) == 2:
+            cfg["lut"] = str(sc_plan["lut"][0])
+            cfg["base_val"] = round(float(sc_plan["lut"][1]), 3)
+        else:
+            cfg["lut"] = str(sc_plan["lut"])
+    if "lut_val" in sc_plan:
+        cfg["base_val"] = round(float(sc_plan["lut_val"]), 3)
+    elif "base_val" in sc_plan:
+        cfg["base_val"] = round(float(sc_plan["base_val"]), 3)
+
+    if "lut_val_bias" in global_plan:
+        cfg["base_val"] = round(clamp(cfg["base_val"] + float(global_plan["lut_val_bias"]), 0.10, 0.32), 3)
+
+    for bias_key in ("temp_bias", "bright_bias", "contrast_bias", "sat_bias", "shadow_bias", "highlight_bias", "tone_bias"):
+        g_b = float(global_plan.get(bias_key, 0.0))
+        s_b = float(sc_plan.get(bias_key, 0.0))
+        cfg[bias_key] = round(g_b + s_b, 4)
+
+    if sc_plan.get("note"):
+        cfg["ai_note"] = str(sc_plan["note"])
+        cfg["profile"] = f"[{cfg['project_model'].upper()} | {cfg['regime']} | AI-Plan: {cfg['ai_note'][:28]}]"
+
+    lut_entry = next((e for e in (optical_db or []) if e["title"] == cfg["lut"]), None)
+    if lut_entry:
+        cfg["sim_anchor"] = simulate_video_through_lut(scene_anchor, lut_entry, cfg["base_val"])
 
 
 def assign_unified_scene_targets(
@@ -664,14 +766,33 @@ def assign_unified_scene_targets(
     optical_db: list[dict],
     allow_bw: bool = False,
     allow_stylized: bool = False,
+    custom_plan: dict = None,
 ):
     """
-    1. Groups scenes sharing the same `(regime, base_location)` so returning to the same room/location
+    1. Honors any AI Colorist scene-level regime overrides (`custom_plan["scenes"]`) BEFORE location grouping.
+    2. Groups scenes sharing the same `(regime, base_location)` so returning to the same room/location
        under the same lighting regime shares the same Primary 35mm LUT family/stock.
-    2. Blends each cluster's own anchor (`c["anchor"]`) with the location-group anchor (`loc_anchor`)
+    3. Blends each cluster's own anchor (`c["anchor"]`) with the location-group anchor (`loc_anchor`)
        so intra-scene shots lock tightly to the scene's actual lighting while cross-scene returns to the
-       same location maintain consistent color identity without crushing bright scenes or lifting dim ones arbitrarily.
+       same location maintain consistent color identity.
+    4. Applies the AI Colorist's bespoke scene targets, Primary LUT choices, and post-LUT biases.
     """
+    custom_plan = custom_plan or {}
+    plan_scenes = custom_plan.get("scenes", {}) or {}
+    global_plan = custom_plan.get("global", {}) or {}
+
+    def _get_sc_plan(c: dict) -> dict:
+        cid_str = str(c["cluster_id"])
+        bg = c["bg_code"]
+        base_loc = bg.split(":")[-1] if ":" in bg else bg
+        return plan_scenes.get(cid_str) or plan_scenes.get(f"S{c['cluster_id']:02d}") or plan_scenes.get(bg) or plan_scenes.get(base_loc) or {}
+
+    # Pre-pass: apply AI Colorist regime overrides before grouping locations
+    for c in clusters:
+        sc_p = _get_sc_plan(c)
+        if sc_p.get("regime"):
+            c["regime"] = str(sc_p["regime"])
+
     total_segs = sum(len(c["seg_indices"]) for c in clusters) or 1
     has_seedance_hook = any(c["bg_code"].startswith("SEEDANCE_HOOK") or c.get("regime") == "SEEDANCE_HOOK" for c in clusters)
     seedance_ref = None
@@ -718,6 +839,18 @@ def assign_unified_scene_targets(
             is_flashback=rep_c.get("is_flashback", False), bg_code=rep_c["bg_code"],
             seedance_ref=seedance_ref, used_primary_luts=used_primary_luts,
         )
+        # Check if any cluster in this location group has an explicit AI LUT in custom_plan so the whole location group can share it
+        for gc in g_clusters:
+            scp = _get_sc_plan(gc)
+            if scp.get("lut"):
+                if isinstance(scp["lut"], (list, tuple)) and len(scp["lut"]) == 2:
+                    group_cfg["lut"] = str(scp["lut"][0])
+                    group_cfg["base_val"] = round(float(scp["lut"][1]), 3)
+                else:
+                    group_cfg["lut"] = str(scp["lut"])
+                    if "lut_val" in scp or "base_val" in scp:
+                        group_cfg["base_val"] = round(float(scp.get("lut_val", scp.get("base_val", group_cfg["base_val"]))), 3)
+                break
         group_primary[gkey] = (loc_anchor, group_cfg)
 
     # Second pass: compute per-cluster scene_anchor & scene_cfg (sharing the location group's Primary LUT)
@@ -747,6 +880,11 @@ def assign_unified_scene_targets(
         lut_entry = next((e for e in (optical_db or []) if e["title"] == cfg["lut"]), None)
         if lut_entry:
             cfg["sim_anchor"] = simulate_video_through_lut(scene_anchor, lut_entry, cfg["base_val"])
+
+        # Apply AI Colorist scene-specific plan overrides (if any)
+        sc_p = _get_sc_plan(c)
+        _apply_ai_scene_plan_override(cfg, scene_anchor, sc_p, global_plan, optical_db)
+
         c["unified_anchor"] = scene_anchor
         c["scene_cfg"] = cfg
 
@@ -777,6 +915,7 @@ def compute_shot_lut_and_adjustments(
     seg_scale: float = 1.0,
     used_shot_luts: dict = None,
     clip_model: str = "",
+    seg_plan: dict = None,
 ) -> tuple[str, float, list, str]:
     """
     Non-Canceling Two-Stage Controller:
@@ -787,6 +926,7 @@ def compute_shot_lut_and_adjustments(
       to `sim_anchor` and eliminating model-specific defects (Grok glare/plastic skin, Omni milky blacks/green cast,
       Seedance dark night shadows).
     """
+    seg_plan = seg_plan or {}
     p5 = m.get("p5", 0.05)
     p25 = m.get("p25", 0.15)
     mid = m.get("mid", 0.28)
@@ -796,6 +936,7 @@ def compute_shot_lut_and_adjustments(
     rb = m.get("rb", 0.13)
     gm = m.get("gm", -0.012)
     sat = m.get("sat", 0.15)
+    neutral_rb = m.get("neutral_rb", rb * 0.45)
     skin_rb = m.get("skin_rb", rb + 0.06)
     skin_sat = m.get("skin_sat", 0.42)
     sharp = m.get("sharp", 0.035)
@@ -831,7 +972,15 @@ def compute_shot_lut_and_adjustments(
     # Stage 1 (zorder 2000): Trigger Counter-Balance Sibling LUT when shot jumps relative to scene_anchor
     jump_th_mid = 0.026 if eff_model in ("grok", "omni", "hybrid") else 0.032
     jump_th_rb = 0.020 if eff_model in ("grok", "omni", "hybrid") else 0.024
-    if abs(d_mid_anchor) > jump_th_mid or abs(d_rb_anchor) > jump_th_rb or abs(d_p5_anchor) > 0.024:
+    if seg_plan.get("lut"):
+        if isinstance(seg_plan["lut"], (list, tuple)) and len(seg_plan["lut"]) == 2:
+            lut_title, base_val = str(seg_plan["lut"][0]), float(seg_plan["lut"][1])
+        else:
+            lut_title = str(seg_plan["lut"])
+            if "lut_val" in seg_plan:
+                base_val = float(seg_plan["lut_val"])
+        prof_note = f"{scene_cfg['profile']} [AI Shot Override]"
+    elif abs(d_mid_anchor) > jump_th_mid or abs(d_rb_anchor) > jump_th_rb or abs(d_p5_anchor) > 0.024:
         fb = "DRAMATIC (14).cube" if d_mid_anchor < -0.038 else ("CINEMATIC  (27).cube" if d_rb_anchor > 0.028 else "SCC-rec709 (23).cube")
         lut_title, base_val, shot_state = match_optimal_lut_by_video_simulation(
             optical_db, m,
@@ -839,12 +988,15 @@ def compute_shot_lut_and_adjustments(
             ("CINEMATIC", "DRAMATIC", "FILM LOOK", "SCC-REC709", "SKINTONE", "MOOD", "ATMOSPHERIC"),
             fb, target_p5=sim_anchor["sim_p5"], target_hi=sim_anchor["sim_hi"],
             used_lut_counts=used_shot_luts, diversity_weight=0.008, is_primary=False,
+            regime=regime,
         )
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Counter-Balance: {shot_state}]"
     elif used_shot_luts is not None:
         used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
     lut_val = round(base_val + clamp(-d_mid_anchor * 0.06, -0.015, 0.015), 3)
+    if "lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple)):
+        lut_val = round(float(seg_plan["lut_val"]), 3)
 
     lut_entry = next((e for e in (optical_db or []) if e["title"] == lut_title), None)
     if lut_entry:
@@ -862,12 +1014,13 @@ def compute_shot_lut_and_adjustments(
     scene_def_gm = _remaining_scene_defect(scene_anchor.get("gm", gm), sim_anchor["sim_gm"], target_gm, deadband=0.005)
     scene_def_sat = _remaining_scene_defect(scene_anchor.get("sat", sat), sim_anchor["sim_sat"], target_sat, deadband=0.008)
 
-    shot_err_p5 = sim["sim_p5"] - sim_anchor["sim_p5"]
-    shot_err_mid = sim["sim_mid"] - sim_anchor["sim_mid"]
-    shot_err_hi = sim["sim_hi"] - sim_anchor["sim_hi"]
-    shot_err_rb = sim["sim_rb"] - sim_anchor["sim_rb"]
-    shot_err_gm = sim["sim_gm"] - sim_anchor["sim_gm"]
-    shot_err_sat = sim["sim_sat"] - sim_anchor["sim_sat"]
+    shot_gain = 1.25 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
+    shot_err_p5 = (sim["sim_p5"] - sim_anchor["sim_p5"]) * shot_gain
+    shot_err_mid = (sim["sim_mid"] - sim_anchor["sim_mid"]) * shot_gain
+    shot_err_hi = (sim["sim_hi"] - sim_anchor["sim_hi"]) * shot_gain
+    shot_err_rb = (sim["sim_rb"] - sim_anchor["sim_rb"]) * shot_gain
+    shot_err_gm = (sim["sim_gm"] - sim_anchor["sim_gm"]) * shot_gain
+    shot_err_sat = (sim["sim_sat"] - sim_anchor["sim_sat"]) * shot_gain
 
     nb_mid_diff = mid - local_neighbor_m.get("mid", mid)
     nb_rb_diff = rb - local_neighbor_m.get("rb", rb)
@@ -882,6 +1035,7 @@ def compute_shot_lut_and_adjustments(
         raw_shd = -res_p5 * 1.30
     else:
         raw_shd = -res_p5 * 2.25 + max(0.0, 0.150 - p25) * 0.45
+    raw_shd += float(scene_cfg.get("shadow_bias", 0.0)) + float(seg_plan.get("shadow_offset", 0.0))
     shadow_val = non_zero_clamp(raw_shd, -0.09, 0.15, min_abs=0.01, default_sign=-1.0 if p5 > 0.085 else 1.0)
     adjust.append(("shadow", shadow_val))
 
@@ -889,12 +1043,13 @@ def compute_shot_lut_and_adjustments(
     res_hi = scene_def_hi + shot_err_hi
     grok_glare_pull = -0.035 if (eff_model == "grok" and p95 > 0.66) else 0.0
     raw_hl = -res_hi * 0.65 - max(0.0, p99 - 0.850) * 0.28 + grok_glare_pull
+    raw_hl += float(scene_cfg.get("highlight_bias", 0.0)) + float(seg_plan.get("highlight_offset", 0.0))
     highlight_val = non_zero_clamp(raw_hl, -0.12, 0.08, min_abs=0.01, default_sign=-1.0 if p95 > 0.66 else 1.0)
     adjust.append(("highlight", highlight_val))
 
     # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "")
     res_mid = scene_def_mid + shot_err_mid
-    raw_br = -res_mid * 0.95 - nb_mid_diff * nb_weight
+    raw_br = -res_mid * 0.95 - nb_mid_diff * nb_weight + float(scene_cfg.get("bright_bias", 0.0)) + float(seg_plan.get("bright_offset", 0.0))
     bright_val = non_zero_clamp(raw_br, -0.11, 0.16, min_abs=0.01, default_sign=1.0 if mid < 0.34 else -1.0)
     adjust.append(("brightness", bright_val))
 
@@ -909,28 +1064,30 @@ def compute_shot_lut_and_adjustments(
     else:
         base_con = +0.022 if c < 0.62 else -0.015
     target_c = target_hi - target_p5
-    raw_con = base_con + (target_c - sim["sim_contrast"]) * 0.22
+    raw_con = base_con + (target_c - sim["sim_contrast"]) * 0.22 + float(scene_cfg.get("contrast_bias", 0.0)) + float(seg_plan.get("contrast_offset", 0.0))
     contrast_val = non_zero_clamp(raw_con, -0.06, 0.05, min_abs=0.01, default_sign=1.0 if base_con >= 0 else -1.0)
     adjust.append(("contrast", contrast_val))
 
     # 5. TONE / TINT (`tone`, v3) — Positive shifts toward magenta (canceling Omni/Grok green cast `gm > 0`)
     res_gm = scene_def_gm + shot_err_gm
-    raw_tone = res_gm * 2.10
+    raw_tone = res_gm * 2.10 + float(scene_cfg.get("tone_bias", 0.0)) + float(seg_plan.get("tone_offset", 0.0))
     tone_val = non_zero_clamp(raw_tone, -0.05, 0.06, min_abs=0.01, default_sign=1.0 if gm >= -0.008 else -1.0)
     adjust.append(("tone", tone_val))
 
     # 6. TEMPERATURE (`temperature`, v3) — Preserves Primary LUT warmth/coolness on anchor while locking shot-to-shot RB & cooling plastic skin
     res_rb = scene_def_rb + shot_err_rb
-    shot_plastic_excess = max(0.0, (skin_rb - 0.228) * 0.45) if eff_model == "grok" else max(0.0, (skin_rb - 0.260) * 0.35)
-    raw_temp = -res_rb * 1.40 - nb_rb_diff * nb_weight - shot_plastic_excess
+    preserve_warm = bool(scene_cfg.get("preserve_warm_props", False)) or (neutral_rb <= 0.082)
+    plastic_thresh = (0.245 if preserve_warm else 0.230) if eff_model == "grok" else 0.262
+    shot_plastic_excess = max(0.0, (skin_rb - plastic_thresh) * (0.35 if preserve_warm else 0.45)) if neutral_rb > 0.065 else 0.0
+    raw_temp = -res_rb * 1.40 - nb_rb_diff * nb_weight - shot_plastic_excess + float(scene_cfg.get("temp_bias", 0.0)) + float(seg_plan.get("temp_offset", 0.0))
     default_temp_sign = 1.0 if regime in ("DAWN_DUSK_GOLD", "WARM_INT") and res_rb <= 0 else -1.0
     temp_val = non_zero_clamp(raw_temp, -0.16, 0.16, min_abs=0.01, default_sign=default_temp_sign)
     adjust.append(("temperature", temp_val))
 
     # 7. SATURATION (`saturation`, v1) — Clean 35mm color density; tames Grok oversaturated orange skin (`skin_sat > 0.47`)
     res_sat = scene_def_sat + shot_err_sat
-    shot_sat_excess = max(0.0, (skin_sat - 0.470) * 0.28) if eff_model == "grok" else max(0.0, (skin_sat - 0.540) * 0.22)
-    raw_sat = -res_sat * 1.15 - nb_sat_diff * (nb_weight * 0.5) - shot_sat_excess
+    shot_sat_excess = max(0.0, (skin_sat - 0.475) * 0.26) if eff_model == "grok" else max(0.0, (skin_sat - 0.540) * 0.22)
+    raw_sat = -res_sat * 1.15 - nb_sat_diff * (nb_weight * 0.5) - shot_sat_excess + float(scene_cfg.get("sat_bias", 0.0)) + float(seg_plan.get("sat_offset", 0.0))
     default_sat_sign = -1.0 if (eff_model == "grok" or res_sat > 0) else 1.0
     sat_val = non_zero_clamp(raw_sat, -0.10, 0.08, min_abs=0.01, default_sign=default_sat_sign)
     adjust.append(("saturation", sat_val))
@@ -1053,6 +1210,12 @@ def apply_3d_lut_and_adjust_to_rgb(rgb: np.ndarray, lut_path: str, lut_val: floa
     return np.clip(out, 0.0, 1.0)
 
 
+def _measure_rgb_mid_rb(rgb: np.ndarray) -> tuple[float, float]:
+    luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    rb = float(np.mean(rgb[..., 0] - rgb[..., 2]))
+    return float(np.median(luma)), rb
+
+
 def render_graded_comparison_sheet(
     all_seg_tuples: list,
     seg_records: list,
@@ -1061,45 +1224,90 @@ def render_graded_comparison_sheet(
     out_jpg: str,
     proj_dir: str = "",
     optical_db: list[dict] = None,
+    seg_applied: dict = None,
 ):
+    """
+    Renders a Multi-Shot Before/After Contact Sheet where each Scene Cluster is a 4-tile strip:
+      [1. Anchor RAW] -> [2. Anchor GRADED]  |  [3. Outlier RAW] -> [4. Outlier GRADED]
+    allowing the AI Colorist to visually inspect both the primary 35mm scene grade and the
+    intra-scene outlier shot convergence.
+    """
     from PIL import Image, ImageDraw
-    w, h, pad_top = 280, 158, 28
-    pair_w = w * 2 + 6
-    cols = 2
+    seg_applied = seg_applied or {}
+    w, h, pad_top, pad_bot = 216, 122, 26, 20
+    strip_w = w * 4 + 14
+    tile_h = h + pad_top + pad_bot
+    cols = 1 if len(clusters) <= 14 else 2
     rows = max(1, (len(clusters) + cols - 1) // cols)
-    sheet = Image.new("RGB", (cols * pair_w + 12, rows * (h + pad_top) + 8), (16, 16, 16))
+    sheet = Image.new("RGB", (cols * strip_w + 16, rows * tile_h + 12), (16, 16, 16))
     draw = ImageDraw.Draw(sheet)
 
-    def _render_pair(idx_c):
-        idx, c = idx_c
-        mid_seg = c["seg_indices"][len(c["seg_indices"]) // 2]
-        _, _, v, _ = all_seg_tuples[mid_seg]
-        rec = seg_records[mid_seg]
+    def _grade_seg(s_idx: int, c: dict):
+        _, _, v, _ = all_seg_tuples[s_idx]
+        rec = seg_records[s_idx]
         cfg = c["scene_cfg"]
         scene_anchor = c.get("unified_anchor") or c["anchor"]
         ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
         vp = resolve_video_path(v.get("path", ""), proj_dir)
         raw_rgb = extract_rgb_frame(vp, ts, w, h)
-        lut_title, lut_val, adj_list, _ = compute_shot_lut_and_adjustments(
-            rec.get("metrics") or scene_anchor, cfg, scene_anchor, scene_anchor, False,
-            optical_db=optical_db, seg_scale=rec.get("scale", 1.0),
-            clip_model=rec.get("clip_model", cfg.get("project_model", "seedance")),
-        )
+        if s_idx in seg_applied:
+            lut_title, lut_val, adj_list, _ = seg_applied[s_idx]
+        else:
+            lut_title, lut_val, adj_list, _ = compute_shot_lut_and_adjustments(
+                rec.get("metrics") or scene_anchor, cfg, scene_anchor, scene_anchor, False,
+                optical_db=optical_db, seg_scale=rec.get("scale", 1.0),
+                clip_model=rec.get("clip_model", cfg.get("project_model", "seedance")),
+            )
         graded_rgb = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, adj_list)
-        return idx, c, raw_rgb, graded_rgb, lut_title, lut_val
+        r_mid, r_rb = _measure_rgb_mid_rb(raw_rgb)
+        g_mid, g_rb = _measure_rgb_mid_rb(graded_rgb)
+        return s_idx, raw_rgb, graded_rgb, lut_title, lut_val, r_mid, r_rb, g_mid, g_rb
+
+    def _render_strip(idx_c):
+        idx, c = idx_c
+        s_indices = c["seg_indices"]
+        anc_seg = c.get("anchor_seg", s_indices[len(s_indices) // 2])
+        out_seg = c.get("outlier_seg", s_indices[-1])
+        anc_res = _grade_seg(anc_seg, c)
+        out_res = _grade_seg(out_seg, c) if out_seg != anc_seg else anc_res
+        return idx, c, anc_res, out_res
 
     with ThreadPoolExecutor(max_workers=12) as pool:
-        rendered = list(pool.map(_render_pair, enumerate(clusters)))
+        rendered = list(pool.map(_render_strip, enumerate(clusters)))
 
-    for idx, c, raw_rgb, graded_rgb, lut_title, lut_val in rendered:
+    for idx, c, anc_res, out_res in rendered:
         r_i, c_i = divmod(idx, cols)
-        x0 = c_i * pair_w + 6
-        y0 = r_i * (h + pad_top) + 4
-        sheet.paste(Image.fromarray((raw_rgb * 255).astype(np.uint8)), (x0, y0 + pad_top))
-        sheet.paste(Image.fromarray((graded_rgb * 255).astype(np.uint8)), (x0 + w + 2, y0 + pad_top))
-        reg_lbl = c.get("regime", "")[:9]
-        lbl = f"S{c['cluster_id']:02d} ({c['bg_code'][:13]}|{reg_lbl}) -> {lut_title[:18]} ({int(lut_val*100)}%)"
-        draw.text((x0 + 4, y0 + 6), lbl, fill=(160, 245, 175))
+        x0 = c_i * strip_w + 8
+        y0 = r_i * tile_h + 6
+        draw.rectangle([x0 - 2, y0, x0 + strip_w - 6, y0 + tile_h - 4], fill=(24, 24, 28), outline=(56, 62, 70))
+
+        a_idx, a_raw, a_grd, a_lut, a_val, ar_m, ar_rb, ag_m, ag_rb = anc_res
+        o_idx, o_raw, o_grd, o_lut, o_val, or_m, or_rb, og_m, og_rb = out_res
+
+        raw_d_mid = abs(or_m - ar_m)
+        raw_d_rb = abs(or_rb - ar_rb)
+        grd_d_mid = abs(og_m - ag_m)
+        grd_d_rb = abs(og_rb - ag_rb)
+
+        reg_lbl = c.get("regime", "")[:12]
+        note_str = f" [{c['scene_cfg'].get('ai_note','')[:20]}]" if c["scene_cfg"].get("ai_note") else ""
+        hdr = (
+            f"S{c['cluster_id']:02d} ({c['bg_code'][:15]}|{reg_lbl}) -> {a_lut[:18]} ({int(a_val*100)}%){note_str} | "
+            f"Spread dMid:{raw_d_mid:.2f}->{grd_d_mid:.2f} dRB:{raw_d_rb:.2f}->{grd_d_rb:.2f}"
+        )
+        draw.text((x0 + 4, y0 + 5), hdr, fill=(160, 245, 175))
+
+        tiles = [
+            (a_raw, f"1.Anc RAW #{a_idx} M:{ar_m:.2f} RB:{ar_rb:+.2f}", (210, 210, 215)),
+            (a_grd, f"2.Anc GRD #{a_idx} M:{ag_m:.2f} RB:{ag_rb:+.2f}", (155, 245, 175)),
+            (o_raw, f"3.Out RAW #{o_idx} M:{or_m:.2f} RB:{or_rb:+.2f}", (245, 205, 155)),
+            (o_grd, f"4.Out GRD #{o_idx} M:{og_m:.2f} RB:{og_rb:+.2f} ({o_lut[:10]})", (155, 235, 250)),
+        ]
+        for t_i, (arr, sub_lbl, col_txt) in enumerate(tiles):
+            tx = x0 + t_i * (w + 3)
+            ty = y0 + pad_top
+            sheet.paste(Image.fromarray((arr * 255).astype(np.uint8)), (tx, ty))
+            draw.text((tx + 3, ty + h + 3), sub_lbl, fill=col_txt)
 
     sheet.save(out_jpg, quality=88)
 
@@ -1355,9 +1563,9 @@ def main():
             loaded = json.load(open(metrics_path, "r", encoding="utf-8"))
             if isinstance(loaded, dict):
                 for r in loaded.get("segments", []):
-                    if r.get("metrics") and "skin_sat" in r["metrics"]:
+                    if r.get("metrics") and "skin_sat" in r["metrics"] and "neutral_rb" in r["metrics"]:
                         preloaded_cache[(r.get("material_name", ""), round(float(r.get("start_sec", 0)), 1), round(float(r.get("dur_sec", 0)), 1))] = r["metrics"]
-                if len(loaded.get("segments", [])) == len(all_seg_tuples) and all("skin_sat" in (r.get("metrics") or {}) for r in loaded["segments"]):
+                if len(loaded.get("segments", [])) == len(all_seg_tuples) and all("neutral_rb" in (r.get("metrics") or {}) for r in loaded["segments"]):
                     seg_records = loaded["segments"]
                     for r in seg_records:
                         if "clip_model" not in r:
@@ -1437,6 +1645,7 @@ def main():
     assign_unified_scene_targets(
         clusters, project_model, args.emotion, optical_db,
         allow_bw=args.allow_bw, allow_stylized=args.allow_stylized,
+        custom_plan=custom_plan,
     )
     seg_to_cluster = {}
     for c in clusters:
@@ -1444,14 +1653,15 @@ def main():
             seg_to_cluster[s_idx] = c
 
     explicit_match = {x.strip() for x in args.match_clips.split(",") if x.strip()}
-    plan_segs = custom_plan.get("segments", {})
+    plan_segs = custom_plan.get("segments", {}) or {}
     default_m = {
         "p5": 0.05, "p25": 0.15, "mid": 0.28, "p95": 0.62, "p99": 0.76, "contrast": 0.55,
-        "rb": 0.13, "gm": -0.012, "sat": 0.15, "hsv_s": 0.45,
+        "rb": 0.13, "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "neutral_rb": 0.045, "neutral_gm": -0.008,
         "skin_rb": 0.20, "skin_gm": -0.025, "skin_sat": 0.42, "sharp": 0.042, "hf_noise": 0.030,
     }
 
     summary = []
+    seg_applied = {}
     total_adjusts = 0
     angle_jump_fixes = 0
     zoomed_count = 0
@@ -1470,8 +1680,8 @@ def main():
         scene_anchor = c_info.get("unified_anchor") or c_info["anchor"]
         scene_cfg = c_info["scene_cfg"]
 
-        if str(idx) in plan_segs or mname in plan_segs:
-            scfg = plan_segs.get(str(idx)) or plan_segs.get(mname)
+        scfg = plan_segs.get(str(idx)) or plan_segs.get(mname) or {}
+        if scfg and "adjust" in scfg and "lut" in scfg and isinstance(scfg["lut"], (list, tuple)):
             adj_list = scfg.get("adjust", [])
             lut_title, val = scfg["lut"]
             prof = scfg.get("profile", "Custom Plan")
@@ -1482,7 +1692,7 @@ def main():
                 nb_ms = [scene_anchor]
             local_nb_m = {k: float(np.mean([x.get(k, m.get(k, default_m[k])) for x in nb_ms])) for k in default_m}
 
-            force_nb = (mname in explicit_match) or (
+            force_nb = (mname in explicit_match) or bool(scfg.get("force_anchor_match")) or (
                 args.auto_match_outliers
                 and (abs(m["rb"] - scene_anchor["rb"]) > 0.035 or abs(m["mid"] - scene_anchor["mid"]) > 0.045)
             )
@@ -1490,9 +1700,12 @@ def main():
                 m, scene_cfg, scene_anchor, local_nb_m, force_nb,
                 optical_db=optical_db, seg_scale=seg_scale, used_shot_luts=used_shot_luts,
                 clip_model=rec.get("clip_model", project_model),
+                seg_plan=scfg,
             )
             if "Angle-Jump" in prof:
                 angle_jump_fixes += 1
+
+        seg_applied[idx] = (lut_title, val, adj_list, prof)
 
         for adj_type, adj_val in adj_list:
             if abs(adj_val) >= 0.005:
@@ -1557,14 +1770,18 @@ def main():
     for c in clusters:
         cfg = c["scene_cfg"]
         sa = c.get("unified_anchor") or c["anchor"]
+        note_tag = f" | Note: {cfg['ai_note']}" if cfg.get("ai_note") else ""
         print(
             f"  - Scene[{c['cluster_id']:2d}] ({c['bg_code']:22s} | {c.get('regime',''):14s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
-            f"Primary LUT: {cfg['lut']:26s} ({cfg['base_val']*100:.0f}%) | Raw Mid={sa['mid']:.2f} RB={sa['rb']:+.2f} -> Target Mid={cfg['target_mid']:.2f} RB={cfg['target_rb']:+.2f}"
+            f"Primary LUT: {cfg['lut']:26s} ({cfg['base_val']*100:.0f}%) | Raw Mid={sa['mid']:.2f} RB={sa['rb']:+.2f} NeutRB={sa.get('neutral_rb',0):+.2f} -> Target Mid={cfg['target_mid']:.2f} RB={cfg['target_rb']:+.2f}{note_tag}"
         )
 
     comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
     try:
-        render_graded_comparison_sheet(all_seg_tuples, seg_records, clusters, lut_map, comp_jpg, proj_dir=proj_dir, optical_db=optical_db)
+        render_graded_comparison_sheet(
+            all_seg_tuples, seg_records, clusters, lut_map, comp_jpg,
+            proj_dir=proj_dir, optical_db=optical_db, seg_applied=seg_applied,
+        )
         print(f"\n[MANDATORY AI VISUAL QA] Rendered RAW vs. GRADED comparison sheet in {time.time() - t0:.1f}s total: {comp_jpg}")
     except Exception as exc:
         print(f"Note: Could not render graded comparison sheet ({exc})")

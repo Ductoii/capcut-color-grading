@@ -182,6 +182,7 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         return {
             "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.28, "p50": 0.27, "p75": 0.40, "p95": 0.62, "p99": 0.75,
             "contrast": 0.57, "iqr_ratio": 0.45, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
+            "neutral_rb": 0.04, "neutral_gm": -0.008,
             "gm": -0.012, "sat": 0.15, "hsv_s": 0.44, "sharp": 0.040, "hf_noise": 0.028,
             "skin_rb": 0.16, "skin_sat": 0.34, "skin_hi": 0.50
         }
@@ -194,17 +195,30 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         mid = float(np.mean(luma))
         contrast = float(p95 - p5)
         iqr_ratio = float((p75 - p25) / max(contrast, 1e-4))
-        rb = float(np.mean(r - b))
-        shd_rb = float(np.mean((r - b)[luma <= p25]))
-        mid_rb = float(np.mean((r - b)[(luma > p25) & (luma < p75)]))
-        hi_rb = float(np.mean((r - b)[luma >= p75]))
-        gm = float(np.mean(g - 0.5 * (r + b)))
+        rb_map = r - b
+        gm_map = g - 0.5 * (r + b)
+        rb = float(np.mean(rb_map))
+        shd_rb = float(np.mean(rb_map[luma <= p25]))
+        mid_rb = float(np.mean(rb_map[(luma > p25) & (luma < p75)]))
+        hi_rb = float(np.mean(rb_map[luma >= p75]))
+        gm = float(np.mean(gm_map))
         cmax = np.max(arr, axis=2)
         cmin = np.min(arr, axis=2)
         chroma = cmax - cmin
         sat = float(np.mean(chroma))
         hsv_s_map = chroma / np.maximum(cmax, 1e-4)
         hsv_s = float(np.mean(hsv_s_map))
+
+        # Achromatic / near-neutral pixel white-balance probe (separates true ambient lighting cast from colorful props/hats/walls)
+        valid_luma = (luma >= 0.06) & (luma <= 0.90)
+        low_chroma_th = max(0.065, float(np.percentile(chroma[valid_luma], 30)) if np.any(valid_luma) else 0.08)
+        neutral_mask = valid_luma & (chroma <= low_chroma_th)
+        if np.sum(neutral_mask) >= 16:
+            neutral_rb = float(np.mean(rb_map[neutral_mask]))
+            neutral_gm = float(np.mean(gm_map[neutral_mask]))
+        else:
+            neutral_rb = float(min(abs(rb), abs(shd_rb), abs(hi_rb)) * (1.0 if rb >= 0 else -1.0))
+            neutral_gm = gm
 
         # Central-frame human skin locus (excludes top sky / bottom floor and pure yellow/wood surfaces)
         rc, gc, bc = r[10:78, 16:144], g[10:78, 16:144], b[10:78, 16:144]
@@ -230,7 +244,8 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
         per_frame.append({
             "p1": p1, "p5": p5, "p25": p25, "mid": mid, "p50": p50, "p75": p75, "p95": p95, "p99": p99,
             "contrast": contrast, "iqr_ratio": iqr_ratio, "rb": rb, "shd_rb": shd_rb, "mid_rb": mid_rb,
-            "hi_rb": hi_rb, "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise,
+            "hi_rb": hi_rb, "neutral_rb": neutral_rb, "neutral_gm": neutral_gm,
+            "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise,
             "skin_rb": skin_rb, "skin_sat": skin_sat, "skin_hi": skin_hi
         })
 
@@ -567,6 +582,7 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
     default_m = {
         "p5": 0.05, "p25": 0.15, "mid": 0.28, "p95": 0.62, "p99": 0.76,
         "contrast": 0.55, "rb": 0.13, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
+        "neutral_rb": 0.04, "neutral_gm": -0.008,
         "gm": -0.012, "sat": 0.15, "hsv_s": 0.45,
         "sharp": 0.042, "hf_noise": 0.030,
         "skin_rb": 0.16, "skin_sat": 0.34, "skin_hi": 0.50
@@ -653,6 +669,13 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
                 regime = "COOL_TECH" if anchor["mid"] <= 0.28 else "DAY_CRISP"
             else:
                 regime = "WARM_INT" if anchor["rb"] >= 0.125 else "DAY_CRISP"
+
+        seg_range = list(range(s_idx, e_idx))
+        anchor_seg = min(seg_range, key=lambda j: abs(ms[j]["mid"] - anchor["mid"]) * 1.4 + abs(ms[j]["rb"] - anchor["rb"]) * 1.8)
+        outlier_seg = max(seg_range, key=lambda j: abs(ms[j]["mid"] - anchor["mid"]) * 1.4 + abs(ms[j]["rb"] - anchor["rb"]) * 1.8)
+        out_d_mid = round(ms[outlier_seg]["mid"] - anchor["mid"], 3)
+        out_d_rb = round(ms[outlier_seg]["rb"] - anchor["rb"], 3)
+
         clusters.append({
             "cluster_id": b_idx,
             "bg_code": bg_code,
@@ -663,8 +686,12 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
             "source_mode": source_mode,
             "start_seg": s_idx,
             "end_seg": e_idx - 1,
-            "seg_indices": list(range(s_idx, e_idx)),
-            "clips": sorted(set(seg_records[j]["material_name"] for j in range(s_idx, e_idx))),
+            "seg_indices": seg_range,
+            "anchor_seg": anchor_seg,
+            "outlier_seg": outlier_seg,
+            "outlier_delta_mid": out_d_mid,
+            "outlier_delta_rb": out_d_rb,
+            "clips": sorted(set(seg_records[j]["material_name"] for j in seg_range)),
             "anchor": anchor,
         })
 
@@ -683,36 +710,71 @@ def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180
 
 
 def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clusters: list, out_jpg: str, proj_dir: str = ""):
+    """
+    Renders a Multi-Shot Scene Strip Contact Sheet (3 representative shots per Scene:
+    [First Shot | Median Anchor Shot | Max-Outlier Shot]) so the AI Colorist can visually inspect
+    both the full scene look (faces, costumes, props, background lighting) and intra-scene camera-angle jumps.
+    """
     from PIL import Image, ImageDraw
-    w, h, pad_top = 280, 158, 24
-    cols = 4
+    tile_w, tile_h = 220, 124
+    strip_w = tile_w * 3 + 10
+    header_h, sub_h = 24, 18
+    block_h = header_h + sub_h + tile_h + 6
+    cols = 2
     rows = max(1, (len(clusters) + cols - 1) // cols)
-    sheet = Image.new("RGB", (cols * w, rows * (h + pad_top)), (18, 18, 18))
+    sheet = Image.new("RGB", (cols * strip_w + 12, rows * block_h + 8), (16, 16, 16))
     draw = ImageDraw.Draw(sheet)
 
-    def _fetch_tile(idx_c):
+    def _fetch_scene_strip(idx_c):
         idx, c = idx_c
-        mid_seg = c["seg_indices"][len(c["seg_indices"]) // 2]
-        _, _, v, _ = all_seg_tuples[mid_seg]
-        rec = seg_records[mid_seg]
-        ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
-        vp = resolve_video_path(v.get("path", ""), proj_dir)
-        return idx, c, extract_rgb_frame(vp, ts, w, h)
+        s_first = c["start_seg"]
+        s_anc = c.get("anchor_seg", c["seg_indices"][len(c["seg_indices"]) // 2])
+        s_out = c.get("outlier_seg", c["end_seg"])
+        if s_out == s_anc and len(c["seg_indices"]) > 1:
+            s_out = c["end_seg"] if c["end_seg"] != s_anc else c["start_seg"]
+        shot_ids = [s_first, s_anc, s_out]
+        frames = []
+        for s_id in shot_ids:
+            _, _, v, _ = all_seg_tuples[s_id]
+            rec = seg_records[s_id]
+            ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+            vp = resolve_video_path(v.get("path", ""), proj_dir)
+            frames.append((s_id, rec, extract_rgb_frame(vp, ts, tile_w, tile_h)))
+        return idx, c, frames
 
     with ThreadPoolExecutor(max_workers=12) as pool:
-        tiles = list(pool.map(_fetch_tile, enumerate(clusters)))
+        strips = list(pool.map(_fetch_scene_strip, enumerate(clusters)))
 
-    for idx, c, rgb in tiles:
-        tile = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8))
+    for idx, c, frames in strips:
         r_i, c_i = divmod(idx, cols)
-        x0, y0 = c_i * w, r_i * (h + pad_top)
-        sheet.paste(tile, (x0, y0 + pad_top))
+        x0 = c_i * strip_w + 6
+        y0 = r_i * block_h + 4
         a = c["anchor"]
-        reg_lbl = c.get("regime", "")[:8]
-        lbl = f"S{c['cluster_id']:02d} ({c['bg_code'][:12]}|{reg_lbl}) Mid:{a['mid']:.2f} RB:{a['rb']:+.2f}"
-        draw.text((x0 + 5, y0 + 5), lbl, fill=(240, 220, 140))
+        reg_lbl = c.get("regime", "")[:10]
+        hdr = (
+            f"S{c['cluster_id']:02d} ({c['bg_code'][:16]}|{reg_lbl}) Segs {c['start_seg']}..{c['end_seg']} | "
+            f"Mid:{a['mid']:.2f} RB:{a['rb']:+.2f} NeutRB:{a.get('neutral_rb',0.0):+.2f} SkinRB:{a.get('skin_rb',0.2):.2f}"
+        )
+        draw.text((x0 + 4, y0 + 4), hdr[:86], fill=(245, 225, 130))
 
-    sheet.save(out_jpg, quality=84)
+        role_names = ("1.First", "2.Anchor", "3.Outlier")
+        for t_i, (s_id, rec, rgb) in enumerate(frames):
+            tx = x0 + t_i * (tile_w + 2)
+            ty = y0 + header_h
+            m = rec.get("metrics") or a
+            if t_i == 2:
+                dm = m.get("mid", a["mid"]) - a["mid"]
+                dr = m.get("rb", a["rb"]) - a["rb"]
+                sub_lbl = f"{role_names[t_i]} #{s_id} (dMid:{dm:+.2f} dRB:{dr:+.2f})"
+                sub_col = (255, 175, 145) if (abs(dm) > 0.035 or abs(dr) > 0.025) else (185, 215, 195)
+            else:
+                sub_lbl = f"{role_names[t_i]} #{s_id} (Mid:{m.get('mid',0):.2f} RB:{m.get('rb',0):+.2f})"
+                sub_col = (185, 215, 235)
+            draw.text((tx + 3, ty + 1), sub_lbl[:36], fill=sub_col)
+            tile_img = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8))
+            sheet.paste(tile_img, (tx, ty + sub_h))
+
+    sheet.save(out_jpg, quality=86)
 
 
 def main():
@@ -790,7 +852,7 @@ def main():
     vals = [r["metrics"] for r in seg_records if r["metrics"]]
     if vals:
         print("\n=== EMPIRICAL SEGMENT METRICS SUMMARY (Medians & P10..P90) ===")
-        for k in ["p5", "p25", "mid", "p95", "contrast", "rb", "gm", "sat", "hsv_s", "skin_rb", "skin_sat", "sharp"]:
+        for k in ["p5", "p25", "mid", "p95", "contrast", "rb", "neutral_rb", "gm", "sat", "hsv_s", "skin_rb", "skin_sat", "sharp"]:
             arr = [x.get(k, 0.0) for x in vals]
             print(f"  {k:10s}: median={np.median(arr):+.4f} | p10={np.percentile(arr, 10):+.3f} .. p90={np.percentile(arr, 90):+.3f}")
 
@@ -800,13 +862,15 @@ def main():
         a = c["anchor"]
         print(
             f"  Scene[{c['cluster_id']:2d}] ({c['bg_code']:18s} | {c.get('regime','AUTO'):14s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
-            f"Anchor: P5={a['p5']:.3f} Mid={a['mid']:.3f} R-B={a['rb']:+.3f} G-M={a['gm']:+.3f} Sat={a['sat']:.3f}"
+            f"Anchor: Mid={a['mid']:.3f} RB={a['rb']:+.3f} NeutRB={a.get('neutral_rb',0.0):+.3f} SkinRB={a['skin_rb']:.3f} | "
+            f"MaxOutlier=#{c['outlier_seg']} (dMid={c['outlier_delta_mid']:+.3f} dRB={c['outlier_delta_rb']:+.3f})"
         )
 
     preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
     try:
         render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir)
-        print(f"\nRendered raw scene contact sheet: {preview_jpg}")
+        print(f"\n[MANDATORY AI COLORIST STEP 1] Rendered Multi-Shot Scene Strip sheet: {preview_jpg}")
+        print("-> AI Colorist MUST call read_file on this sheet to inspect all 3 shots (First | Anchor | Outlier) per scene before grading!")
     except Exception as exc:
         print(f"Note: Could not render raw scene preview sheet ({exc})")
 
@@ -817,6 +881,7 @@ def main():
         "raw_preview_sheet": preview_jpg,
         "clip_bg_map": {str(k): v for k, v in clip_bg_map.items()},
         "bg_context": bg_context,
+        "clusters": clusters,
         "segments": seg_records,
     }
     default_cache = get_default_metrics_cache_path(proj_dir)
