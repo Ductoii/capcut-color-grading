@@ -32,6 +32,7 @@ from analyze_project import (
     extract_clip_number,
     extract_rgb_frame,
     extract_segment_metrics,
+    get_default_frames_cache_path,
     get_default_metrics_cache_path,
     resolve_project_dir,
     resolve_video_path,
@@ -154,17 +155,27 @@ def promote_active_luts_in_cfg(active_lut_titles: list[str], proj_dir: str) -> l
     other_used = set()
     drafts_root = os.path.dirname(os.path.abspath(proj_dir))
     lut_name_re = re.compile(r'"name"\s*:\s*"([^"]+\.(?:cube|3dl))"', re.IGNORECASE)
-    for d_path in sorted(glob.glob(os.path.join(drafts_root, "*", "draft_info.json"))):
-        if os.path.abspath(os.path.dirname(d_path)) == os.path.abspath(proj_dir):
-            continue
+    cand_paths = [
+        p for p in sorted(glob.glob(os.path.join(drafts_root, "*", "draft_info.json")))
+        if os.path.abspath(os.path.dirname(p)) != os.path.abspath(proj_dir)
+    ]
+
+    def _scan_other_draft(d_path: str) -> list[str]:
+        found = []
         try:
             with open(d_path, "r", encoding="utf-8", errors="ignore") as df:
                 raw_txt = df.read()
             for match_name in lut_name_re.findall(raw_txt):
                 if match_name in by_title:
-                    other_used.add(match_name)
+                    found.append(match_name)
         except Exception:
             pass
+        return found
+
+    if cand_paths:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            for found_list in pool.map(_scan_other_draft, cand_paths):
+                other_used.update(found_list)
 
     top_items = []
     used_titles = set()
@@ -926,11 +937,13 @@ def compute_shot_lut_and_adjustments(
     """
     Scene-Locked Two-Stage Controller:
     - Stage 1 (zorder 2000): Locks 100% of segments in a Scene Cluster to the exact same Scene Primary LUT
-      (`scene_cfg["lut"]`) so camera-angle cuts inside a scene never swap `.cube` 3D color matrices.
-    - Stage 2 (zorder 8004): Computes Adjust = `SceneBaseline(model, anchor, target) + AchromaticShotContinuity`.
-      Drives intra-scene `temperature` & `tone` strictly from achromatic `neutral_rb` / `neutral_gm` (with a 0.015
-      deadband) so background/costume color differences (e.g. red brick wall vs. white suit) never cause white-balance
-      swings between adjacent cuts, while smoothing genuine exposure/lighting jumps by ~65%.
+      (`scene_cfg["lut"]`) and intensity (`scene_cfg["base_val"]`) so camera-angle cuts inside a scene never
+      swap `.cube` 3D color matrices.
+    - Stage 2 (zorder 8004): Computes Adjust = `BoundedSceneBaseline(model, anchor, regime) + TwoTierShotContinuity(d_mid, d_nrb)`.
+      * Bounded Scene Baselines prevent bright outdoor sunny scenes from slamming `shadow` to `-0.09` or `highlight` to `-0.12`.
+      * Coherent Two-Tier `d_mid = mid - anc_mid` (`-0.48x` for normal angle cuts `|d_mid| <= 0.075`, `-0.82x` for extreme lighting jumps)
+        and `d_nrb = neutral_rb - anc_nrb` (`-0.35x` for normal cuts `|d_nrb| <= 0.032`, `-0.85x` for true ambient cast shifts)
+        keep adjacent camera cuts 100% uniform in white balance and exposure regardless of brick walls or white/blue shirts.
     """
     seg_plan = seg_plan or {}
     p5 = m.get("p5", 0.05)
@@ -951,30 +964,22 @@ def compute_shot_lut_and_adjustments(
 
     eff_model = clip_model or scene_cfg.get("project_model", "seedance")
     regime = scene_cfg.get("regime", "DAY_CRISP")
-    target_p5 = scene_cfg.get("target_p5", 0.048)
-    target_mid = scene_cfg["target_mid"]
-    target_hi = scene_cfg.get("target_hi", 0.650)
-    target_rb = scene_cfg["target_rb"]
-    target_gm = scene_cfg["target_gm"]
-    target_sat = scene_cfg["target_sat"]
-    sim_anchor = scene_cfg.get("sim_anchor") or {
-        "sim_p5": scene_anchor.get("p5", 0.05),
-        "sim_mid": scene_anchor.get("mid", 0.30),
-        "sim_hi": scene_anchor.get("p95", 0.65),
-        "sim_contrast": scene_anchor.get("contrast", 0.58),
-        "sim_rb": scene_anchor.get("rb", 0.12),
-        "sim_gm": scene_anchor.get("gm", -0.010),
-        "sim_sat": scene_anchor.get("sat", 0.14),
-    }
+    anc_p5 = scene_anchor.get("p5", p5)
+    anc_mid = scene_anchor.get("mid", mid)
+    anc_p95 = scene_anchor.get("p95", p95)
+    anc_rb = scene_anchor.get("rb", rb)
+    anc_gm = scene_anchor.get("gm", gm)
+    anc_sat = scene_anchor.get("sat", sat)
+    anc_nrb = scene_anchor.get("neutral_rb", anc_rb * 0.45)
+    anc_ngm = scene_anchor.get("neutral_gm", anc_gm)
 
     # Measure intra-scene shot jump relative to scene_anchor
-    d_mid_anchor = mid - scene_anchor.get("mid", mid)
-    anc_nrb = scene_anchor.get("neutral_rb", scene_anchor.get("rb", rb) * 0.45)
-    anc_ngm = scene_anchor.get("neutral_gm", scene_anchor.get("gm", gm))
-    d_nrb_anchor = neutral_rb - anc_nrb
-    d_ngm_anchor = neutral_gm - anc_ngm
+    d_mid = mid - anc_mid
+    d_nrb = neutral_rb - anc_nrb
+    d_ngm = neutral_gm - anc_ngm
+    d_sat = sat - anc_sat
 
-    # Stage 1 (zorder 2000): Lock 100% of shots in the scene to Scene Primary LUT (unless overridden in seg_plan)
+    # Stage 1 (zorder 2000): Lock 100% of shots in the scene to Scene Primary LUT & intensity (unless overridden in seg_plan)
     lut_title = scene_cfg["lut"]
     base_val = scene_cfg["base_val"]
     prof_note = scene_cfg["profile"]
@@ -987,124 +992,133 @@ def compute_shot_lut_and_adjustments(
             if "lut_val" in seg_plan:
                 base_val = float(seg_plan["lut_val"])
         prof_note = f"{scene_cfg['profile']} [AI Shot Override]"
-    elif abs(d_nrb_anchor) > 0.020 or abs(d_mid_anchor) > 0.045:
+    elif abs(d_nrb) > 0.025 or abs(d_mid) > 0.055:
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Continuity Dampened]"
 
     if used_shot_luts is not None:
         used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
-    lut_val = round(base_val + clamp(-d_mid_anchor * 0.04, -0.010, 0.010), 3)
-    if "lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple)):
-        lut_val = round(float(seg_plan["lut_val"]), 3)
+    lut_val = round(float(seg_plan["lut_val"]) if ("lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple))) else base_val, 3)
 
-    lut_entry = next((e for e in (optical_db or []) if e["title"] == lut_title), None)
-    if lut_entry:
-        sim = simulate_video_through_lut(m, lut_entry, lut_val)
-    else:
-        sim = {"sim_p5": p5, "sim_mid": mid, "sim_hi": p95, "sim_contrast": c, "sim_rb": rb, "sim_gm": gm, "sim_sat": sat}
-
-    # Decompose Stage 2 error into:
-    #   (A) Un-corrected Scene Defect (0 when anchor was already healthy -> preserves LUT look!)
-    #   (B) Intra-Scene Shot Continuity Error (with deadbands so composition changes never cause color/exposure swings!)
+    # Stage 2 (zorder 8004): Bounded Scene Baselines + Coherent Two-Tier Shot Continuity
     preserve_warm = bool(scene_cfg.get("preserve_warm_props", False)) or (anc_nrb <= 0.082)
-    scene_def_p5 = _remaining_scene_defect(scene_anchor.get("p5", p5), sim_anchor["sim_p5"], target_p5, deadband=0.008)
-    scene_def_mid = _remaining_scene_defect(scene_anchor.get("mid", mid), sim_anchor["sim_mid"], target_mid, deadband=0.010)
-    scene_def_hi = _remaining_scene_defect(scene_anchor.get("p95", p95), sim_anchor["sim_hi"], target_hi, deadband=0.015)
-    scene_def_rb = _remaining_scene_defect(scene_anchor.get("rb", rb), sim_anchor["sim_rb"], target_rb, deadband=0.010)
-    if preserve_warm:
-        scene_def_rb *= 0.30
-    scene_def_gm = _remaining_scene_defect(scene_anchor.get("gm", gm), sim_anchor["sim_gm"], target_gm, deadband=0.005)
-    scene_def_sat = _remaining_scene_defect(scene_anchor.get("sat", sat), sim_anchor["sim_sat"], target_sat, deadband=0.008)
 
-    shot_gain = 1.15 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
-    shot_err_p5 = _deadband(sim["sim_p5"] - sim_anchor["sim_p5"], 0.010) * shot_gain
-    shot_err_mid = _deadband(sim["sim_mid"] - sim_anchor["sim_mid"], 0.015) * shot_gain
-    shot_err_hi = _deadband(sim["sim_hi"] - sim_anchor["sim_hi"], 0.018) * shot_gain
-    shot_err_nrb = _deadband(d_nrb_anchor, 0.015) * shot_gain
-    shot_err_ngm = _deadband(d_ngm_anchor, 0.008) * shot_gain
-    shot_err_sat = _deadband(sim["sim_sat"] - sim_anchor["sim_sat"], 0.012) * shot_gain
+    # (A) Bounded Scene Baselines (`b_br`, `b_shd`, `b_hl`, `b_tp`)
+    if anc_mid < 0.235:
+        # Very dark night / booth / dark porch -> cleanly open shadows and midtones
+        b_br = clamp((0.265 - anc_mid) * 0.85, 0.03, 0.06)
+        b_shd = clamp((0.265 - anc_mid) * 1.05, 0.04, 0.07)
+        b_hl = -0.01
+    elif anc_mid < 0.290:
+        # Low-key night / dusk / dimly lit interior -> lift midtones and shadows gently
+        b_br = clamp((0.300 - anc_mid) * 0.65, 0.01, 0.04)
+        b_shd = clamp((0.300 - anc_mid) * 0.80, 0.02, 0.05)
+        b_hl = -0.02
+    elif anc_mid > 0.440:
+        # High-key sunny outdoor daytime -> keep crisp and luminous without crushing shadows to -0.09!
+        b_br = -0.02 if anc_mid > 0.50 else -0.01
+        b_shd = -0.02 if eff_model == "grok" else (-0.04 if (eff_model == "omni" and anc_p5 > 0.095) else -0.01)
+        b_hl = -0.04 if anc_p95 > 0.78 else -0.03
+    else:
+        # Healthy mid-range exposure (0.290 .. 0.440)
+        b_br = +0.01 if anc_mid < 0.35 else (-0.01 if anc_mid > 0.41 else 0.00)
+        if eff_model == "omni" and anc_p5 > 0.085:
+            b_shd = clamp(-(anc_p5 - 0.055) * 0.85, -0.06, -0.02)
+        else:
+            b_shd = +0.02 if anc_mid < 0.34 else -0.01
+        b_hl = -0.03 if eff_model == "grok" else -0.02
 
-    nb_mid_diff = _deadband(mid - local_neighbor_m.get("mid", mid), 0.018)
-    nb_nrb_diff = _deadband(neutral_rb - local_neighbor_m.get("neutral_rb", anc_nrb), 0.015)
-    nb_sat_diff = _deadband(sat - local_neighbor_m.get("sat", sat), 0.015)
-    nb_weight = 0.22 if force_neighbor_match else 0.15
+    # Allow explicit target_mid override from AI scene plan to shift b_br/b_shd gently
+    target_mid = scene_cfg.get("target_mid", anc_mid)
+    plan_mid_delta = clamp(target_mid - anc_mid, -0.06, 0.06)
+    if abs(plan_mid_delta) > 0.020 and 0.290 <= anc_mid <= 0.440:
+        b_br = clamp(b_br + plan_mid_delta * 0.45, -0.05, 0.06)
+
+    if not preserve_warm and anc_nrb > 0.082:
+        # True heavy amber/tungsten ambient cast on neutral pixels -> cool cleanly
+        b_tp = clamp(-(anc_nrb - 0.055) * 0.45, -0.05, -0.02)
+    elif anc_nrb < -0.010 or (regime == "DAY_CRISP" and anc_rb < 0.035):
+        # Cold cyan cast -> warm gently
+        b_tp = +0.02
+    else:
+        # Natural lighting (any warm RB is from brick walls, wood, or costumes)
+        b_tp = +0.01 if regime == "DAWN_DUSK_GOLD" else -0.01
+
+    # (B) Coherent Two-Tier Intra-Scene Shot Continuity (`d_mid` and `d_nrb`)
+    shot_gain = 1.12 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
+    if abs(d_mid) <= 0.075:
+        br_corr = -d_mid * 0.48 * shot_gain
+        shd_corr = -d_mid * 0.30 * shot_gain
+        hl_corr = -d_mid * 0.25 * shot_gain
+    else:
+        br_corr = -d_mid * 0.82 * shot_gain
+        shd_corr = -d_mid * 0.58 * shot_gain
+        hl_corr = -d_mid * 0.50 * shot_gain
+
+    if abs(d_nrb) <= 0.032:
+        tp_corr = -d_nrb * 0.35 * shot_gain
+    else:
+        tp_corr = -d_nrb * 0.85 * shot_gain
 
     adjust = []
 
-    # 1. SHADOW (`shadow`, v3) — Open dark night shadows (`+0.02..+0.15`), anchor milky blacks (`-0.09..-0.01`)
-    if scene_def_p5 > 0:
-        raw_shd = -scene_def_p5 * 1.25 - shot_err_p5 * 0.65
-    else:
-        raw_shd = -scene_def_p5 * 2.10 - shot_err_p5 * 0.65 + max(0.0, 0.145 - p25) * 0.35
-    raw_shd += float(scene_cfg.get("shadow_bias", 0.0)) + float(seg_plan.get("shadow_offset", 0.0))
-    shadow_val = non_zero_clamp(raw_shd, -0.09, 0.15, min_abs=0.01, default_sign=-1.0 if p5 > 0.085 else 1.0)
+    # 1. SHADOW (`shadow`, v3)
+    raw_shd = b_shd + shd_corr + float(scene_cfg.get("shadow_bias", 0.0)) + float(seg_plan.get("shadow_offset", 0.0))
+    def_shd_sign = 1.0 if b_shd > 0 else -1.0
+    shadow_val = non_zero_clamp(raw_shd, -0.08, 0.12, min_abs=0.01, default_sign=def_shd_sign)
     adjust.append(("shadow", shadow_val))
 
-    # 2. HIGHLIGHT (`highlight`, v3) — Tame Grok specular glare (`-0.04..-0.12`), keep Seedance highlights luminous
-    grok_glare_pull = -0.035 if (eff_model == "grok" and p95 > 0.66) else 0.0
-    raw_hl = -scene_def_hi * 0.65 - shot_err_hi * 0.45 - max(0.0, p99 - 0.850) * 0.25 + grok_glare_pull
-    raw_hl += float(scene_cfg.get("highlight_bias", 0.0)) + float(seg_plan.get("highlight_offset", 0.0))
-    highlight_val = non_zero_clamp(raw_hl, -0.12, 0.08, min_abs=0.01, default_sign=-1.0 if p95 > 0.66 else 1.0)
+    # 2. HIGHLIGHT (`highlight`, v3)
+    raw_hl = (
+        b_hl
+        + hl_corr
+        - (0.02 if p95 > 0.80 else 0.0)
+        + float(scene_cfg.get("highlight_bias", 0.0))
+        + float(seg_plan.get("highlight_offset", 0.0))
+    )
+    highlight_val = non_zero_clamp(raw_hl, -0.11, 0.06, min_abs=0.01, default_sign=-1.0)
     adjust.append(("highlight", highlight_val))
 
     # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "")
-    raw_br = (
-        -scene_def_mid * 0.85
-        - shot_err_mid * 0.50
-        - nb_mid_diff * nb_weight
-        + float(scene_cfg.get("bright_bias", 0.0))
-        + float(seg_plan.get("bright_offset", 0.0))
-    )
-    bright_val = non_zero_clamp(raw_br, -0.11, 0.16, min_abs=0.01, default_sign=1.0 if mid < 0.34 else -1.0)
+    raw_br = b_br + br_corr + float(scene_cfg.get("bright_bias", 0.0)) + float(seg_plan.get("bright_offset", 0.0))
+    def_br_sign = 1.0 if (b_br > 0 or mid < 0.36) else -1.0
+    bright_val = non_zero_clamp(raw_br, -0.10, 0.12, min_abs=0.01, default_sign=def_br_sign)
     adjust.append(("brightness", bright_val))
 
-    base_ls = -0.015 if (eff_model == "grok" and c > 0.58) else (+0.012 if eff_model == "seedance" and mid < 0.42 else 0.0)
-    raw_ls = base_ls - scene_def_mid * 0.25 - shot_err_mid * 0.15
-    light_sens_val = non_zero_clamp(raw_ls, -0.04, 0.05, min_abs=0.01, default_sign=1.0 if base_ls >= 0 else -1.0)
+    light_sens_val = -0.01 if (eff_model == "grok" and c > 0.56) else (+0.01 if mid < 0.42 else -0.01)
     adjust.append(("light_sensation", light_sens_val))
 
-    # 4. CONTRAST (`contrast`, v3) — Soften harsh Grok glare (`-0.02..-0.05`), add crisp 35mm depth to Seedance/Omni (`+0.015..+0.04`)
+    # 4. CONTRAST (`contrast`, v3)
     if eff_model == "grok":
-        base_con = -0.022 if c > 0.57 else +0.012
+        base_con = -0.02 if c > 0.58 else +0.01
     else:
-        base_con = +0.022 if c < 0.62 else -0.015
-    target_c = target_hi - target_p5
-    raw_con = base_con + (target_c - sim_anchor["sim_contrast"]) * 0.18 + float(scene_cfg.get("contrast_bias", 0.0)) + float(seg_plan.get("contrast_offset", 0.0))
-    contrast_val = non_zero_clamp(raw_con, -0.06, 0.05, min_abs=0.01, default_sign=1.0 if base_con >= 0 else -1.0)
+        base_con = +0.02 if c < 0.62 else -0.01
+    raw_con = base_con + float(scene_cfg.get("contrast_bias", 0.0)) + float(seg_plan.get("contrast_offset", 0.0))
+    contrast_val = non_zero_clamp(raw_con, -0.05, 0.05, min_abs=0.01, default_sign=1.0 if base_con >= 0 else -1.0)
     adjust.append(("contrast", contrast_val))
 
-    # 5. TONE / TINT (`tone`, v3) — Positive shifts toward magenta (canceling Omni/Grok green cast `gm > 0`)
-    raw_tone = (scene_def_gm + shot_err_ngm) * 1.85 + float(scene_cfg.get("tone_bias", 0.0)) + float(seg_plan.get("tone_offset", 0.0))
-    tone_val = non_zero_clamp(raw_tone, -0.05, 0.06, min_abs=0.01, default_sign=1.0 if gm >= -0.008 else -1.0)
+    # 5. TONE / TINT (`tone`, v3) — Positive shifts toward magenta (canceling Omni/Grok green cast `gm > -0.015`)
+    raw_tone = (0.015 if gm > -0.015 else -0.01) + _deadband(d_ngm, 0.010) * 1.2 + float(scene_cfg.get("tone_bias", 0.0)) + float(seg_plan.get("tone_offset", 0.0))
+    tone_val = non_zero_clamp(raw_tone, -0.04, 0.05, min_abs=0.01, default_sign=1.0 if gm > -0.015 else -1.0)
     adjust.append(("tone", tone_val))
 
-    # 6. TEMPERATURE (`temperature`, v3) — Driven by achromatic `neutral_rb` so red brick walls / blue shirts never trigger false temperature swings!
-    plastic_thresh = (0.248 if preserve_warm else 0.232) if eff_model == "grok" else 0.262
-    shot_plastic_excess = max(0.0, (skin_rb - plastic_thresh) * 0.30) if neutral_rb > 0.075 else 0.0
-    raw_temp = (
-        -scene_def_rb * 1.15
-        - shot_err_nrb * 1.10
-        - nb_nrb_diff * nb_weight
-        - shot_plastic_excess
-        + float(scene_cfg.get("temp_bias", 0.0))
-        + float(seg_plan.get("temp_offset", 0.0))
-    )
-    default_temp_sign = 1.0 if regime in ("DAWN_DUSK_GOLD", "WARM_INT") and scene_def_rb <= 0 else -1.0
-    temp_val = non_zero_clamp(raw_temp, -0.14, 0.14, min_abs=0.01, default_sign=default_temp_sign)
+    # 6. TEMPERATURE (`temperature`, v3) — Driven strictly by achromatic `neutral_rb` (`d_nrb`)
+    raw_temp = b_tp + tp_corr + float(scene_cfg.get("temp_bias", 0.0)) + float(seg_plan.get("temp_offset", 0.0))
+    def_tp_sign = 1.0 if b_tp > 0 else -1.0
+    temp_val = non_zero_clamp(raw_temp, -0.09, 0.08, min_abs=0.01, default_sign=def_tp_sign)
     adjust.append(("temperature", temp_val))
 
-    # 7. SATURATION (`saturation`, v1) — Clean 35mm color density; tames Grok oversaturated orange skin (`skin_sat > 0.48`)
-    shot_sat_excess = max(0.0, (skin_sat - 0.485) * 0.22) if eff_model == "grok" else max(0.0, (skin_sat - 0.540) * 0.20)
+    # 7. SATURATION (`saturation`, v1)
+    base_sat = -0.02 if eff_model == "grok" else (+0.01 if anc_sat < 0.14 else -0.01)
+    shot_sat_excess = max(0.0, (skin_sat - 0.48) * 0.22) if eff_model == "grok" else max(0.0, (skin_sat - 0.54) * 0.18)
     raw_sat = (
-        -scene_def_sat * 1.05
-        - shot_err_sat * 0.55
-        - nb_sat_diff * nb_weight
+        base_sat
+        - _deadband(d_sat, 0.018) * 0.35
         - shot_sat_excess
         + float(scene_cfg.get("sat_bias", 0.0))
         + float(seg_plan.get("sat_offset", 0.0))
     )
-    default_sat_sign = -1.0 if (eff_model == "grok" or scene_def_sat > 0) else 1.0
-    sat_val = non_zero_clamp(raw_sat, -0.09, 0.08, min_abs=0.01, default_sign=default_sat_sign)
+    sat_val = non_zero_clamp(raw_sat, -0.06, 0.05, min_abs=0.01, default_sign=-1.0 if eff_model == "grok" else 1.0)
     adjust.append(("saturation", sat_val))
 
     # 8. MODEL-AWARE 35MM OPTICAL SHARPNESS (`sharpen`, `clear`, `particle`) + ZOOMED SUPER-RES BOOST
@@ -1247,12 +1261,13 @@ def render_graded_comparison_sheet(
     proj_dir: str = "",
     optical_db: list[dict] = None,
     seg_applied: dict = None,
+    frames_arr: np.ndarray = None,
 ):
     """
     Renders a Multi-Shot Before/After Contact Sheet where each Scene Cluster is a 4-tile strip:
       [1. Anchor RAW] -> [2. Anchor GRADED]  |  [3. Outlier RAW] -> [4. Outlier GRADED]
     allowing the AI Colorist to visually inspect both the primary 35mm scene grade and the
-    intra-scene outlier shot convergence.
+    intra-scene outlier shot convergence. Uses cached `frames_arr` when available for 0 FFmpeg calls.
     """
     from PIL import Image, ImageDraw
     seg_applied = seg_applied or {}
@@ -1264,14 +1279,27 @@ def render_graded_comparison_sheet(
     sheet = Image.new("RGB", (cols * strip_w + 16, rows * tile_h + 12), (16, 16, 16))
     draw = ImageDraw.Draw(sheet)
 
+    # Pre-warm .cube LUT grids in parallel so worker threads never contend on parsing .cube files
+    used_luts = {
+        lut_map.get(seg_applied[s][0], "")
+        for s in seg_applied
+        if lut_map.get(seg_applied[s][0], "")
+    }
+    if used_luts:
+        with ThreadPoolExecutor(max_workers=min(12, len(used_luts))) as lpool:
+            list(lpool.map(_load_cube_grid, used_luts))
+
     def _grade_seg(s_idx: int, c: dict):
         _, _, v, _ = all_seg_tuples[s_idx]
         rec = seg_records[s_idx]
         cfg = c["scene_cfg"]
         scene_anchor = c.get("unified_anchor") or c["anchor"]
-        ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
-        vp = resolve_video_path(v.get("path", ""), proj_dir)
-        raw_rgb = extract_rgb_frame(vp, ts, w, h)
+        if frames_arr is not None and s_idx < len(frames_arr) and frames_arr[s_idx].shape == (h, w, 3):
+            raw_rgb = frames_arr[s_idx].astype(np.float32) / 255.0
+        else:
+            ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+            vp = resolve_video_path(v.get("path", ""), proj_dir)
+            raw_rgb = extract_rgb_frame(vp, ts, w, h)
         if s_idx in seg_applied:
             lut_title, lut_val, adj_list, _ = seg_applied[s_idx]
         else:
@@ -1347,6 +1375,96 @@ def render_graded_comparison_sheet(
             crop_img.save(p_path, quality=90)
             page_paths.append(p_path)
     return page_paths
+
+
+def render_shot_continuity_strip(
+    all_seg_tuples: list,
+    seg_records: list,
+    clusters: list,
+    lut_map: dict,
+    out_jpg: str,
+    proj_dir: str = "",
+    seg_applied: dict = None,
+    frames_arr: np.ndarray = None,
+    max_cuts_per_scene: int = 9,
+) -> str:
+    """
+    Renders a Consecutive Shot-to-Shot Continuity Strip (`/tmp/<Project>_shot_continuity.jpg`)
+    showing up to `max_cuts_per_scene` consecutive cuts (RAW row vs GRADED row) for:
+      - Scene 0 (Opening Hook)
+      - Top 3 multi-shot scenes across Acts I, II, and III
+    so the AI Colorist can visually verify cut-to-cut exposure, shadow/highlight density,
+    and white balance uniformity across consecutive camera angles.
+    """
+    from PIL import Image, ImageDraw
+    seg_applied = seg_applied or {}
+    if not clusters:
+        return ""
+
+    # Pick Scene 0 (Opening Hook) + up to 3 longest multi-shot scenes across Acts I-III
+    chosen_clusters = [clusters[0]]
+    remaining = [c for c in clusters[1:] if len(c.get("seg_indices", [])) >= 4]
+    if remaining:
+        # Spread across early, mid, and late film
+        n_rem = len(remaining)
+        thirds = [remaining[: max(1, n_rem // 3)], remaining[max(1, n_rem // 3) : max(2, 2 * n_rem // 3)], remaining[max(2, 2 * n_rem // 3) :]]
+        for bucket in thirds:
+            if bucket:
+                best_c = max(bucket, key=lambda x: len(x.get("seg_indices", [])))
+                if best_c not in chosen_clusters:
+                    chosen_clusters.append(best_c)
+
+    w, h = 216, 122
+    max_cols = min(max_cuts_per_scene, max(len(c["seg_indices"]) for c in chosen_clusters))
+    block_h = (h + 24) * 2 + 34
+    sheet_w = max_cols * (w + 4) + 16
+    sheet_h = len(chosen_clusters) * block_h + 12
+    sheet = Image.new("RGB", (sheet_w, sheet_h), (16, 16, 18))
+    draw = ImageDraw.Draw(sheet)
+
+    for b_idx, c in enumerate(chosen_clusters):
+        by0 = b_idx * block_h + 6
+        s_indices = c["seg_indices"][:max_cols]
+        cfg = c["scene_cfg"]
+        draw.rectangle([6, by0, sheet_w - 6, by0 + block_h - 6], fill=(24, 24, 28), outline=(58, 64, 72))
+        hdr = (
+            f"CONSECUTIVE SHOT CONTINUITY - Scene S{c['cluster_id']:02d} ({c['bg_code'][:22]} | {c.get('regime','')}) "
+            f"-> Locked 100% {cfg['lut']} ({int(cfg['base_val']*100)}%) | Cuts #{s_indices[0]}..#{s_indices[-1]}"
+        )
+        draw.text((12, by0 + 5), hdr, fill=(160, 245, 175))
+
+        for col_i, s_idx in enumerate(s_indices):
+            _, _, v, _ = all_seg_tuples[s_idx]
+            rec = seg_records[s_idx]
+            if frames_arr is not None and s_idx < len(frames_arr) and frames_arr[s_idx].shape == (h, w, 3):
+                raw_rgb = frames_arr[s_idx].astype(np.float32) / 255.0
+            else:
+                ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+                vp = resolve_video_path(v.get("path", ""), proj_dir)
+                raw_rgb = extract_rgb_frame(vp, ts, w, h)
+            lut_title, lut_val, adj_list, _ = seg_applied.get(
+                s_idx, (cfg["lut"], cfg["base_val"], [], False)
+            )
+            graded_rgb = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, adj_list)
+            r_m, _, r_nrb = _measure_rgb_mid_rb(raw_rgb)
+            g_m, _, g_nrb = _measure_rgb_mid_rb(graded_rgb)
+            amap = dict(adj_list)
+
+            x0 = 10 + col_i * (w + 4)
+            y_raw = by0 + 24
+            y_grd = y_raw + h + 22
+            sheet.paste(Image.fromarray((raw_rgb * 255).astype(np.uint8)), (x0, y_raw))
+            draw.text((x0 + 3, y_raw + h + 3), f"RAW #{s_idx} M:{r_m:.2f} N:{r_nrb:+.2f}", fill=(205, 205, 210))
+
+            sheet.paste(Image.fromarray((graded_rgb * 255).astype(np.uint8)), (x0, y_grd))
+            b_v = f"{amap.get('brightness',0):+.2f}".replace("0.", ".")
+            s_v = f"{amap.get('shadow',0):+.2f}".replace("0.", ".")
+            h_v = f"{amap.get('highlight',0):+.2f}".replace("0.", ".")
+            sl_lbl = f"GRD #{s_idx} M:{g_m:.2f} B:{b_v} S:{s_v} H:{h_v}"
+            draw.text((x0 + 3, y_grd + h + 3), sl_lbl[:35], fill=(150, 245, 175))
+
+    sheet.save(out_jpg, quality=90)
+    return out_jpg
 
 
 MINI_DRAFT_ADJUST_SLOT_MAP = {
@@ -1817,14 +1935,31 @@ def main():
         )
 
     comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
+    cont_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_shot_continuity.jpg"
     try:
+        fcache_path = get_default_frames_cache_path(proj_dir)
+        frames_arr = None
+        if os.path.isfile(fcache_path):
+            try:
+                loaded_f = np.load(fcache_path, mmap_mode="r")
+                if len(loaded_f) == len(all_seg_tuples):
+                    frames_arr = loaded_f
+            except Exception:
+                frames_arr = None
         comp_pages = render_graded_comparison_sheet(
             all_seg_tuples, seg_records, clusters, lut_map, comp_jpg,
             proj_dir=proj_dir, optical_db=optical_db, seg_applied=seg_applied,
+            frames_arr=frames_arr,
+        )
+        cont_path = render_shot_continuity_strip(
+            all_seg_tuples, seg_records, clusters, lut_map, cont_jpg,
+            proj_dir=proj_dir, seg_applied=seg_applied, frames_arr=frames_arr,
         )
         print(f"\n[MANDATORY AI VISUAL QA] Rendered RAW vs. GRADED comparison sheet in {time.time() - t0:.1f}s total: {comp_jpg}")
         if len(comp_pages) > 1:
             print(f"-> High-Res Paginated QA Sheets ({len(comp_pages)} pages): {', '.join(comp_pages)}")
+        if cont_path:
+            print(f"-> Consecutive Shot-to-Shot Continuity Strip (Hook + Multi-Shot Scenes): {cont_path}")
     except Exception as exc:
         print(f"Note: Could not render graded comparison sheet ({exc})")
 

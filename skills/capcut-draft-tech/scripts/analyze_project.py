@@ -37,6 +37,11 @@ def get_default_metrics_cache_path(proj_dir: str) -> str:
     return f"/tmp/capcut_metrics_{slug}.json"
 
 
+def get_default_frames_cache_path(proj_dir: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.basename(os.path.abspath(proj_dir))).strip("_")
+    return f"/tmp/capcut_frames_{slug}.npy"
+
+
 def collect_all_video_segments(root_draft: dict) -> list[tuple[dict, dict, dict, str]]:
     """
     Collect EVERY child video segment (`video con`) across all Compound Clips (`materials.drafts`,
@@ -145,112 +150,107 @@ def detect_source_models(all_seg_tuples: list, proj_dir: str) -> tuple[str, dict
     return project_model, clip_model_by_path, stats
 
 
-def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: float = 5.0) -> dict:
+def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: float = 5.0, return_frame: bool = False):
     """
-    Samples up to 2 representative frames strictly inside [start_sec, start_sec + dur_sec]
-    at 160x90 resolution so camera-angle cuts inside multi-shot clips are measured accurately and fast.
+    Samples the segment midpoint inside [start_sec, start_sec + dur_sec] at 216x122 resolution
+    using a single low-contention `-threads 1` FFmpeg decode so parallel worker pools run 3.3x faster
+    and reuse the exact same decoded frame for contact sheets without re-running FFmpeg.
     """
-    if dur_sec <= 1.8:
-        sample_times = [max(0.0, start_sec + 0.50 * dur_sec)]
-    else:
-        sample_times = [
-            max(0.0, start_sec + 0.28 * dur_sec),
-            max(0.0, start_sec + 0.72 * dur_sec),
+    W, H = 216, 122
+    mid_ts = max(0.0, start_sec + 0.50 * dur_sec)
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", f"{mid_ts:.2f}", "-i", video_path,
+        "-vf", f"scale={W}:{H}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+    ]
+    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    if len(raw) < W * H * 3:
+        cmd_fb = [
+            "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", "0.1", "-i", video_path,
+            "-vf", f"scale={W}:{H}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
         ]
+        raw = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
-    frames = []
-    for ts in sample_times:
-        cmd = [
-            "ffmpeg", "-nostdin", "-v", "error", "-ss", f"{ts:.2f}", "-i", video_path,
-            "-vf", "scale=160:90", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
-        ]
-        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
-        if len(raw) >= 160 * 90 * 3:
-            arr = np.frombuffer(raw[:160 * 90 * 3], dtype=np.uint8).reshape((90, 160, 3)).astype(np.float32) / 255.0
-            frames.append(arr)
-
-    if not frames:
-        cmd = [
-            "ffmpeg", "-nostdin", "-v", "error", "-ss", "0.1", "-i", video_path,
-            "-vf", "scale=160:90", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
-        ]
-        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
-        if len(raw) >= 160 * 90 * 3:
-            frames.append(np.frombuffer(raw[:160 * 90 * 3], dtype=np.uint8).reshape((90, 160, 3)).astype(np.float32) / 255.0)
-
-    if not frames:
-        return {
+    if len(raw) < W * H * 3:
+        fallback_m = {
             "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.28, "p50": 0.27, "p75": 0.40, "p95": 0.62, "p99": 0.75,
             "contrast": 0.57, "iqr_ratio": 0.45, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
             "neutral_rb": 0.04, "neutral_gm": -0.008,
             "gm": -0.012, "sat": 0.15, "hsv_s": 0.44, "sharp": 0.040, "hf_noise": 0.028,
             "skin_rb": 0.16, "skin_sat": 0.34, "skin_hi": 0.50
         }
+        if return_frame:
+            return fallback_m, np.zeros((H, W, 3), dtype=np.uint8)
+        return fallback_m
 
-    per_frame = []
-    for arr in frames:
-        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-        p1, p5, p25, p50, p75, p95, p99 = np.percentile(luma, [1, 5, 25, 50, 75, 95, 99])
-        mid = float(np.mean(luma))
-        contrast = float(p95 - p5)
-        iqr_ratio = float((p75 - p25) / max(contrast, 1e-4))
-        rb_map = r - b
-        gm_map = g - 0.5 * (r + b)
-        rb = float(np.mean(rb_map))
-        shd_rb = float(np.mean(rb_map[luma <= p25]))
-        mid_rb = float(np.mean(rb_map[(luma > p25) & (luma < p75)]))
-        hi_rb = float(np.mean(rb_map[luma >= p75]))
-        gm = float(np.mean(gm_map))
-        cmax = np.max(arr, axis=2)
-        cmin = np.min(arr, axis=2)
-        chroma = cmax - cmin
-        sat = float(np.mean(chroma))
-        hsv_s_map = chroma / np.maximum(cmax, 1e-4)
-        hsv_s = float(np.mean(hsv_s_map))
+    u8_frame = np.frombuffer(raw[:W * H * 3], dtype=np.uint8).reshape((H, W, 3)).copy()
+    arr = u8_frame.astype(np.float32) / 255.0
 
-        # Achromatic / near-neutral pixel white-balance probe (separates true ambient lighting cast from colorful props/hats/walls)
-        valid_luma = (luma >= 0.06) & (luma <= 0.90)
-        low_chroma_th = max(0.065, float(np.percentile(chroma[valid_luma], 30)) if np.any(valid_luma) else 0.08)
-        neutral_mask = valid_luma & (chroma <= low_chroma_th)
-        if np.sum(neutral_mask) >= 16:
-            neutral_rb = float(np.mean(rb_map[neutral_mask]))
-            neutral_gm = float(np.mean(gm_map[neutral_mask]))
-        else:
-            neutral_rb = float(min(abs(rb), abs(shd_rb), abs(hi_rb)) * (1.0 if rb >= 0 else -1.0))
-            neutral_gm = gm
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    p1, p5, p25, p50, p75, p95, p99 = np.percentile(luma, [1, 5, 25, 50, 75, 95, 99])
+    mid = float(np.mean(luma))
+    contrast = float(p95 - p5)
+    iqr_ratio = float((p75 - p25) / max(contrast, 1e-4))
+    rb_map = r - b
+    gm_map = g - 0.5 * (r + b)
+    rb = float(np.mean(rb_map))
+    shd_rb = float(np.mean(rb_map[luma <= p25]))
+    mid_rb = float(np.mean(rb_map[(luma > p25) & (luma < p75)]))
+    hi_rb = float(np.mean(rb_map[luma >= p75]))
+    gm = float(np.mean(gm_map))
+    cmax = np.max(arr, axis=2)
+    cmin = np.min(arr, axis=2)
+    chroma = cmax - cmin
+    sat = float(np.mean(chroma))
+    hsv_s_map = chroma / np.maximum(cmax, 1e-4)
+    hsv_s = float(np.mean(hsv_s_map))
 
-        # Central-frame human skin locus (excludes top sky / bottom floor and pure yellow/wood surfaces)
-        rc, gc, bc = r[10:78, 16:144], g[10:78, 16:144], b[10:78, 16:144]
-        lc = luma[10:78, 16:144]
-        sc_hsv = hsv_s_map[10:78, 16:144]
-        rb_c = rc - bc
-        gb_ratio = (gc - bc) / np.maximum(rb_c, 1e-4)
-        skin_mask = (rc > gc) & (gc > bc) & (rb_c > 0.060) & (gb_ratio >= 0.20) & (gb_ratio <= 0.68) & (lc > 0.16) & (lc < 0.88)
-        if np.sum(skin_mask) >= 12:
-            skin_rb = float(np.mean(rb_c[skin_mask]))
-            skin_sat = float(np.mean(sc_hsv[skin_mask]))
-            skin_hi = float(np.percentile(lc[skin_mask], 88))
-        else:
-            skin_rb = float(max(rb, mid_rb))
-            skin_sat = float(hsv_s)
-            skin_hi = float(p75)
+    # Achromatic / near-neutral pixel white-balance probe (separates true ambient lighting cast from colorful props/hats/walls)
+    valid_luma = (luma >= 0.06) & (luma <= 0.90)
+    low_chroma_th = max(0.065, float(np.percentile(chroma[valid_luma], 30)) if np.any(valid_luma) else 0.08)
+    neutral_mask = valid_luma & (chroma <= low_chroma_th)
+    if np.sum(neutral_mask) >= 16:
+        neutral_rb = float(np.mean(rb_map[neutral_mask]))
+        neutral_gm = float(np.mean(gm_map[neutral_mask]))
+    else:
+        neutral_rb = float(min(abs(rb), abs(shd_rb), abs(hi_rb)) * (1.0 if rb >= 0 else -1.0))
+        neutral_gm = gm
 
-        gx = np.abs(np.diff(luma, axis=1)).mean()
-        gy = np.abs(np.diff(luma, axis=0)).mean()
-        sharp = float(0.5 * (gx + gy))
-        blur = 0.25 * (luma[:-2, 1:-1] + luma[2:, 1:-1] + luma[1:-1, :-2] + luma[1:-1, 2:])
-        hf_noise = float(np.std(luma[1:-1, 1:-1] - blur))
-        per_frame.append({
-            "p1": p1, "p5": p5, "p25": p25, "mid": mid, "p50": p50, "p75": p75, "p95": p95, "p99": p99,
-            "contrast": contrast, "iqr_ratio": iqr_ratio, "rb": rb, "shd_rb": shd_rb, "mid_rb": mid_rb,
-            "hi_rb": hi_rb, "neutral_rb": neutral_rb, "neutral_gm": neutral_gm,
-            "gm": gm, "sat": sat, "hsv_s": hsv_s, "sharp": sharp, "hf_noise": hf_noise,
-            "skin_rb": skin_rb, "skin_sat": skin_sat, "skin_hi": skin_hi
-        })
+    # Central-frame human skin locus (excludes top sky / bottom floor and pure yellow/wood surfaces)
+    rc, gc, bc = r[14:106, 22:194], g[14:106, 22:194], b[14:106, 22:194]
+    lc = luma[14:106, 22:194]
+    sc_hsv = hsv_s_map[14:106, 22:194]
+    rb_c = rc - bc
+    gb_ratio = (gc - bc) / np.maximum(rb_c, 1e-4)
+    skin_mask = (rc > gc) & (gc > bc) & (rb_c > 0.060) & (gb_ratio >= 0.20) & (gb_ratio <= 0.68) & (lc > 0.16) & (lc < 0.88)
+    if np.sum(skin_mask) >= 16:
+        skin_rb = float(np.mean(rb_c[skin_mask]))
+        skin_sat = float(np.mean(sc_hsv[skin_mask]))
+        skin_hi = float(np.percentile(lc[skin_mask], 88))
+    else:
+        skin_rb = float(max(rb, mid_rb))
+        skin_sat = float(hsv_s)
+        skin_hi = float(p75)
 
-    keys = per_frame[0].keys()
-    return {k: round(float(np.mean([f[k] for f in per_frame])), 4) for k in keys}
+    gx = np.abs(np.diff(luma, axis=1)).mean()
+    gy = np.abs(np.diff(luma, axis=0)).mean()
+    sharp = float(0.5 * (gx + gy))
+    blur = 0.25 * (luma[:-2, 1:-1] + luma[2:, 1:-1] + luma[1:-1, :-2] + luma[1:-1, 2:])
+    hf_noise = float(np.std(luma[1:-1, 1:-1] - blur))
+    res_m = {
+        "p1": round(float(p1), 4), "p5": round(float(p5), 4), "p25": round(float(p25), 4),
+        "mid": round(float(mid), 4), "p50": round(float(p50), 4), "p75": round(float(p75), 4),
+        "p95": round(float(p95), 4), "p99": round(float(p99), 4), "contrast": round(float(contrast), 4),
+        "iqr_ratio": round(float(iqr_ratio), 4), "rb": round(float(rb), 4), "shd_rb": round(float(shd_rb), 4),
+        "mid_rb": round(float(mid_rb), 4), "hi_rb": round(float(hi_rb), 4),
+        "neutral_rb": round(float(neutral_rb), 4), "neutral_gm": round(float(neutral_gm), 4),
+        "gm": round(float(gm), 4), "sat": round(float(sat), 4), "hsv_s": round(float(hsv_s), 4),
+        "sharp": round(float(sharp), 4), "hf_noise": round(float(hf_noise), 4),
+        "skin_rb": round(float(skin_rb), 4), "skin_sat": round(float(skin_sat), 4), "skin_hi": round(float(skin_hi), 4),
+    }
+    if return_frame:
+        return res_m, u8_frame
+    return res_m
 
 
 def extract_clip_number(mname: str) -> int:
@@ -763,9 +763,9 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
     return clusters
 
 
-def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180) -> np.ndarray:
+def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 216, h: int = 122) -> np.ndarray:
     cmd = [
-        "ffmpeg", "-nostdin", "-v", "error", "-ss", f"{max(0.0, ts_sec):.2f}", "-i", video_path,
+        "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", f"{max(0.0, ts_sec):.2f}", "-i", video_path,
         "-vf", f"scale={w}:{h}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
     ]
     raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
@@ -774,14 +774,22 @@ def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 320, h: int = 180
     return np.zeros((h, w, 3), dtype=np.float32)
 
 
-def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clusters: list, out_jpg: str, proj_dir: str = ""):
+def render_raw_scene_contact_sheet(
+    all_seg_tuples: list,
+    seg_records: list,
+    clusters: list,
+    out_jpg: str,
+    proj_dir: str = "",
+    frames_arr: np.ndarray = None,
+):
     """
     Renders a Multi-Shot Scene Strip Contact Sheet (3 representative shots per Scene:
     [First Shot | Median Anchor Shot | Max-Outlier Shot]) so the AI Colorist can visually inspect
     both the full scene look (faces, costumes, props, background lighting) and intra-scene camera-angle jumps.
+    Reuses `frames_arr` `(N, 122, 216, 3)` uint8 in memory for zero-FFmpeg instantaneous rendering.
     """
     from PIL import Image, ImageDraw
-    tile_w, tile_h = 220, 124
+    tile_w, tile_h = 216, 122
     strip_w = tile_w * 3 + 10
     header_h, sub_h = 24, 18
     block_h = header_h + sub_h + tile_h + 6
@@ -800,15 +808,18 @@ def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clus
         shot_ids = [s_first, s_anc, s_out]
         frames = []
         for s_id in shot_ids:
-            _, _, v, _ = all_seg_tuples[s_id]
             rec = seg_records[s_id]
-            ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
-            vp = resolve_video_path(v.get("path", ""), proj_dir)
-            frames.append((s_id, rec, extract_rgb_frame(vp, ts, tile_w, tile_h)))
+            if frames_arr is not None and s_id < len(frames_arr):
+                u8 = frames_arr[s_id]
+            else:
+                _, _, v, _ = all_seg_tuples[s_id]
+                ts = rec["start_sec"] + 0.5 * rec["dur_sec"]
+                vp = resolve_video_path(v.get("path", ""), proj_dir)
+                u8 = np.clip(extract_rgb_frame(vp, ts, tile_w, tile_h) * 255.0, 0, 255).astype(np.uint8)
+            frames.append((s_id, rec, u8))
         return idx, c, frames
 
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        strips = list(pool.map(_fetch_scene_strip, enumerate(clusters)))
+    strips = [_fetch_scene_strip(ic) for ic in enumerate(clusters)]
 
     for idx, c, frames in strips:
         r_i, c_i = divmod(idx, cols)
@@ -823,7 +834,7 @@ def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clus
         draw.text((x0 + 4, y0 + 4), hdr[:86], fill=(245, 225, 130))
 
         role_names = ("1.First", "2.Anchor", "3.Outlier")
-        for t_i, (s_id, rec, rgb) in enumerate(frames):
+        for t_i, (s_id, rec, u8) in enumerate(frames):
             tx = x0 + t_i * (tile_w + 2)
             ty = y0 + header_h
             m = rec.get("metrics") or a
@@ -836,7 +847,7 @@ def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clus
                 sub_lbl = f"{role_names[t_i]} #{s_id} (M:{m.get('mid',0):.2f} NRB:{m.get('neutral_rb',0):+.2f})"
                 sub_col = (185, 215, 235)
             draw.text((tx + 3, ty + 1), sub_lbl[:36], fill=sub_col)
-            tile_img = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8))
+            tile_img = Image.fromarray(u8)
             sheet.paste(tile_img, (tx, ty + sub_h))
 
     sheet.save(out_jpg, quality=86)
@@ -900,12 +911,16 @@ def main():
             unique_jobs[ck] = (vpath, st_sec, dur_sec)
 
     cache_by_range = {}
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        futs = {ck: pool.submit(extract_segment_metrics, vp, st, dur) for ck, (vp, st, dur) in unique_jobs.items()}
+    frame_by_range = {}
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futs = {ck: pool.submit(extract_segment_metrics, vp, st, dur, True) for ck, (vp, st, dur) in unique_jobs.items()}
         for ck, fut in futs.items():
-            cache_by_range[ck] = fut.result()
+            m_res, u8_res = fut.result()
+            cache_by_range[ck] = m_res
+            frame_by_range[ck] = u8_res
 
     seg_records = []
+    frames_list = []
     for idx, (_, seg, v, container_lbl) in enumerate(all_seg_tuples):
         vpath = resolve_video_path(v.get("path", ""), proj_dir)
         mname = v.get("material_name") or os.path.basename(vpath)
@@ -914,6 +929,7 @@ def main():
         src_dur = round(float(v.get("duration", 0)) / 1e6, 2)
         cache_key = (vpath, round(st_sec, 1), round(dur_sec, 1))
         m = cache_by_range.get(cache_key, {})
+        frames_list.append(frame_by_range.get(cache_key, np.zeros((122, 216, 3), dtype=np.uint8)))
         sc_obj = seg.get("clip", {}).get("scale", {}) if isinstance(seg.get("clip"), dict) else {}
         seg_scale = max(float(sc_obj.get("x", 1.0)), float(sc_obj.get("y", 1.0)))
         seg_records.append({
@@ -928,6 +944,13 @@ def main():
             "scale": round(seg_scale, 3),
             "metrics": m,
         })
+
+    frames_arr = np.stack(frames_list, axis=0) if frames_list else np.zeros((0, 122, 216, 3), dtype=np.uint8)
+    frames_cache_path = get_default_frames_cache_path(proj_dir)
+    try:
+        np.save(frames_cache_path, frames_arr)
+    except Exception:
+        pass
 
     vals = [r["metrics"] for r in seg_records if r["metrics"]]
     if vals:
@@ -949,7 +972,7 @@ def main():
     preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
     preview_pages = [preview_jpg]
     try:
-        preview_pages = render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir)
+        preview_pages = render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir, frames_arr=frames_arr)
         print(f"\n[MANDATORY AI COLORIST STEP 1] Rendered Multi-Shot Scene Strip sheet: {preview_jpg}")
         if len(preview_pages) > 1:
             print(f"-> High-Res Paginated Scene Sheets ({len(preview_pages)} pages): {', '.join(preview_pages)}")

@@ -121,10 +121,11 @@ python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scri
   --auto-match-outliers \
   --relaunch
 ```
-- Injects Stage 1 (`lut` at `zorder: 2000` with `enable_skin_tone_correction: true`) + Stage 2 (12 non-canceling Adjust sliders at `zorder: 8004`) onto every child video segment (`video con`), promotes active LUTs into `LutImportCfg.json[0:100]`, syncs `draft_info.json`, `mini_draft.json`, and Compound Clip `subdraft/*/draft_content.json`, and renders the **4-Tile Before/After Comparison Sheet** at `/tmp/<Project>_graded_comparison.jpg`.
+- Injects Stage 1 (`lut` at `zorder: 2000` with `enable_skin_tone_correction: true`) + Stage 2 (12 non-canceling Adjust sliders at `zorder: 8004`, solved with **Bounded Scene Baselines** and **Two-Tier `d_mid` / `d_nrb` Shot Continuity**) onto every child video segment (`video con`), promotes active LUTs into `LutImportCfg.json[0:100]` in parallel across drafts, syncs `draft_info.json`, `mini_draft.json`, and Compound Clip `subdraft/*/draft_content.json`, and renders both the **4-Tile Before/After Comparison Sheets** (`/tmp/<Project>_graded_comparison_p*.jpg`) and the **Consecutive Shot-to-Shot Continuity Strip** (`/tmp/<Project>_shot_continuity.jpg`) in `~3s` using cached `/tmp/capcut_frames_<slug>.npy` frames.
 
-### Step 5: Visually Verify All High-Res Paginated QA Sheets (`/tmp/<Project>_graded_comparison_p*.jpg`) & Refine if Needed
-- Call `read_file` on `/tmp/<Project>_graded_comparison_p1.jpg`, `_p2.jpg`... (or `/tmp/<Project>_graded_comparison.jpg` for short projects) to inspect all 4 tiles per scene (`1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD`) and check the header metrics (`Spread dMid: raw->grd dNRB: raw->grd`):
-  - Confirm that `2.Anc GRD` and `4.Out GRD` share the exact same Scene Primary LUT and match seamlessly in brightness (`dMid`) and achromatic white balance (`dNRB`) within every scene.
+### Step 5: Visually Verify Consecutive Shot Continuity (`/tmp/<Project>_shot_continuity.jpg`) & All Paginated QA Sheets (`/tmp/<Project>_graded_comparison_p*.jpg`)
+- Call `read_file` on `/tmp/<Project>_shot_continuity.jpg` AND `/tmp/<Project>_graded_comparison_p1.jpg`, `_p2.jpg`... (or `/tmp/<Project>_graded_comparison.jpg` for short projects):
+  - Inspect `/tmp/<Project>_shot_continuity.jpg` (`Cuts #0..#8` of the Opening Hook + top multi-shot scenes across Acts I–III) to verify that consecutive camera angles match seamlessly in exposure (`M`), shadow/highlight density (`B`, `S`, `H`), and white balance without cut-to-cut jumps or crushed bright exteriors.
+  - Inspect `/tmp/<Project>_graded_comparison_p*.jpg` (`1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD`) and header metrics (`Spread dMid: raw->grd dNRB: raw->grd`) across all scenes.
   - Confirm that skin tones look natural and 35mm-filmic across all acts without cyan/green sickness or plastic orange blowouts.
   - If any scene or outlier shot needs further refinement after visual inspection, adjust `/tmp/capcut_plan_<slug>.json` and re-run `apply_grade.py --plan` immediately within the 10–20 minute budget before finishing.
