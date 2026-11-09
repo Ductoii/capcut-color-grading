@@ -1388,6 +1388,116 @@ def _measure_rgb_mid_rb(rgb: np.ndarray) -> tuple[float, float, float]:
     return float(np.median(luma)), rb, nrb
 
 
+def refine_grades_closed_loop_on_frames(
+    seg_applied: dict,
+    clusters: list,
+    frames_arr: np.ndarray,
+    lut_map: dict,
+) -> dict:
+    """
+    Closed-Loop Pixel-Level 3D LUT + Adjust Verification & Feedback Trim:
+    1. Evaluates the actual 3D `.cube` trilinear LUT (with `tt_skin_seg` skin protection) + Adjust sliders
+       on every segment's decoded RGB frame (`frames_arr`).
+    2. Measures the true post-grade pixel Luma (`g_mid`) and Achromatic White Balance (`g_nrb`) for every shot.
+    3. Applies a closed-loop residual feedback trim to `brightness`, `shadow`, `highlight`, and `temperature`
+       whenever a shot's post-LUT output still deviates from its Sub-Space Anchor + Immediate Same-Space Neighbor.
+    4. Returns quantitative before/after cut-to-cut continuity statistics across the entire timeline.
+    """
+    if frames_arr is None or len(frames_arr) == 0:
+        return {"closed_loop_trims": 0, "raw_cut_dmid": 0.0, "grd_cut_dmid": 0.0, "raw_cut_dnrb": 0.0, "grd_cut_dnrb": 0.0}
+
+    used_luts = {lut_map.get(seg_applied[s][0], "") for s in seg_applied if lut_map.get(seg_applied[s][0], "")}
+    if used_luts:
+        with ThreadPoolExecutor(max_workers=min(12, len(used_luts))) as lpool:
+            list(lpool.map(_load_cube_grid, used_luts))
+
+    def _eval_seg(s_idx: int):
+        raw_rgb = frames_arr[s_idx].astype(np.float32) / 255.0
+        lut_title, lut_val, adj_list, _ = seg_applied[s_idx]
+        grd_rgb = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, adj_list)
+        r_m, _, r_nrb = _measure_rgb_mid_rb(raw_rgb)
+        g_m, _, g_nrb = _measure_rgb_mid_rb(grd_rgb)
+        return s_idx, raw_rgb, r_m, r_nrb, g_m, g_nrb
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        eval_res = dict((r[0], r[1:]) for r in pool.map(_eval_seg, sorted(seg_applied.keys())))
+
+    trims = 0
+    raw_cut_dmids, grd_cut_dmids = [], []
+    raw_cut_dnrbs, grd_cut_dnrbs = [], []
+
+    for c in clusters:
+        s_indices = c.get("seg_indices", [])
+        if len(s_indices) < 2:
+            continue
+        sub_map = c.get("subspace_by_seg", {})
+        groups = defaultdict(list)
+        for s_idx in s_indices:
+            if s_idx in sub_map:
+                groups[sub_map[s_idx][2]].append(s_idx)
+            else:
+                groups["MAIN"].append(s_idx)
+
+        for _, grp in groups.items():
+            if len(grp) < 2:
+                continue
+            sub_g_mid = float(np.median([eval_res[i][3] for i in grp]))
+            sub_g_nrb = float(np.median([eval_res[i][4] for i in grp]))
+
+            for pos, s_idx in enumerate(grp):
+                raw_rgb, r_m, r_nrb, g_m, g_nrb = eval_res[s_idx]
+                nb_idxs = [grp[p] for p in range(max(0, pos - 1), min(len(grp), pos + 2)) if grp[p] != s_idx]
+                nb_g_mid = float(np.mean([eval_res[j][3] for j in nb_idxs])) if nb_idxs else sub_g_mid
+                nb_g_nrb = float(np.mean([eval_res[j][4] for j in nb_idxs])) if nb_idxs else sub_g_nrb
+
+                ref_g_mid = 0.65 * sub_g_mid + 0.35 * nb_g_mid
+                ref_g_nrb = 0.65 * sub_g_nrb + 0.35 * nb_g_nrb
+
+                res_mid = g_m - ref_g_mid
+                res_nrb = g_nrb - ref_g_nrb
+
+                if abs(res_mid) > 0.014 or abs(res_nrb) > 0.010:
+                    lut_title, lut_val, adj_list, prof = seg_applied[s_idx]
+                    adict = dict(adj_list)
+                    if abs(res_mid) > 0.014:
+                        adict["brightness"] = non_zero_clamp(
+                            adict.get("brightness", 0.0) - res_mid * 0.42, -0.10, 0.12, min_abs=0.01, default_sign=-1.0
+                        )
+                        adict["shadow"] = non_zero_clamp(
+                            adict.get("shadow", 0.0) - res_mid * 0.24, -0.08, 0.12, min_abs=0.01, default_sign=-1.0
+                        )
+                        adict["highlight"] = non_zero_clamp(
+                            adict.get("highlight", 0.0) - res_mid * 0.20, -0.11, 0.06, min_abs=0.01, default_sign=-1.0
+                        )
+                    if abs(res_nrb) > 0.010:
+                        adict["temperature"] = non_zero_clamp(
+                            adict.get("temperature", 0.0) - res_nrb * 0.45, -0.09, 0.08, min_abs=0.01, default_sign=-1.0
+                        )
+                    new_adj = [(k, adict[k]) for k, _ in adj_list]
+                    seg_applied[s_idx] = (lut_title, lut_val, new_adj, prof)
+                    new_grd = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, new_adj)
+                    ng_m, _, ng_nrb = _measure_rgb_mid_rb(new_grd)
+                    eval_res[s_idx] = (raw_rgb, r_m, r_nrb, ng_m, ng_nrb)
+                    trims += 1
+
+            for pos in range(len(grp) - 1):
+                i1, i2 = grp[pos], grp[pos + 1]
+                _, r_m1, r_nrb1, g_m1, g_nrb1 = eval_res[i1]
+                _, r_m2, r_nrb2, g_m2, g_nrb2 = eval_res[i2]
+                raw_cut_dmids.append(abs(r_m2 - r_m1))
+                grd_cut_dmids.append(abs(g_m2 - g_m1))
+                raw_cut_dnrbs.append(abs(r_nrb2 - r_nrb1))
+                grd_cut_dnrbs.append(abs(g_nrb2 - g_nrb1))
+
+    return {
+        "closed_loop_trims": trims,
+        "raw_cut_dmid": round(float(np.mean(raw_cut_dmids)) if raw_cut_dmids else 0.0, 4),
+        "grd_cut_dmid": round(float(np.mean(grd_cut_dmids)) if grd_cut_dmids else 0.0, 4),
+        "raw_cut_dnrb": round(float(np.mean(raw_cut_dnrbs)) if raw_cut_dnrbs else 0.0, 4),
+        "grd_cut_dnrb": round(float(np.mean(grd_cut_dnrbs)) if grd_cut_dnrbs else 0.0, 4),
+    }
+
+
 def render_graded_comparison_sheet(
     all_seg_tuples: list,
     seg_records: list,
@@ -1987,12 +2097,18 @@ def main():
             lut_title, val = scfg["lut"]
             prof = scfg.get("profile", "Custom Plan")
         else:
-            # Select healthy immediate neighbors in the SAME sub-space (excluding extreme 1-shot glitches)
+            # Select healthy immediate neighbors in the SAME sub-space (using boundary exit/entry metrics when adjacent)
             nb_ms = []
             for j in c_indices:
                 if j != idx and abs(j - idx) <= 3:
-                    mj = seg_records[j].get("metrics") or default_m
+                    mj = dict(seg_records[j].get("metrics") or default_m)
                     if abs(mj.get("mid", 0.3) - scene_anchor.get("mid", 0.3)) <= 0.095 and abs(mj.get("neutral_rb", 0.04) - scene_anchor.get("neutral_rb", 0.04)) <= 0.045:
+                        if j == idx - 1 and "exit_mid" in mj:
+                            mj["mid"] = 0.50 * float(mj["mid"]) + 0.50 * float(mj["exit_mid"])
+                            mj["neutral_rb"] = 0.50 * float(mj.get("neutral_rb", 0.04)) + 0.50 * float(mj.get("exit_nrb", mj.get("neutral_rb", 0.04)))
+                        elif j == idx + 1 and "entry_mid" in mj:
+                            mj["mid"] = 0.50 * float(mj["mid"]) + 0.50 * float(mj["entry_mid"])
+                            mj["neutral_rb"] = 0.50 * float(mj.get("neutral_rb", 0.04)) + 0.50 * float(mj.get("entry_nrb", mj.get("neutral_rb", 0.04)))
                         nb_ms.append(mj)
             if not nb_ms:
                 nb_ms = [scene_anchor]
@@ -2017,6 +2133,26 @@ def main():
                 angle_jump_fixes += 1
 
         seg_applied[idx] = (lut_title, val, adj_list, prof)
+
+    # 4b. Closed-Loop Pixel-Level Verification & Residual Trim on cached frames (`frames_arr`)
+    fcache_path = get_default_frames_cache_path(proj_dir)
+    frames_arr = None
+    if os.path.isfile(fcache_path):
+        try:
+            loaded_f = np.load(fcache_path, mmap_mode="r")
+            if len(loaded_f) == len(all_seg_tuples):
+                frames_arr = loaded_f
+        except Exception:
+            frames_arr = None
+
+    cl_stats = refine_grades_closed_loop_on_frames(seg_applied, clusters, frames_arr, lut_map)
+
+    for idx, (d_obj, seg, _, _) in enumerate(all_seg_tuples):
+        effects = d_obj["materials"].setdefault("effects", [])
+        rec = seg_records[idx]
+        mname = rec["material_name"]
+        c_info = seg_to_cluster[idx]
+        lut_title, val, adj_list, prof = seg_applied[idx]
 
         for adj_type, adj_val in adj_list:
             if abs(adj_val) >= 0.005:
@@ -2075,8 +2211,9 @@ def main():
     print(
         f"Graded {len(summary)} child video segments across {len(clusters)} Scene Clusters ({mode_str}) in '{os.path.basename(proj_dir)}' "
         f"[Model: {project_model.upper()} (buckets={model_stats['duration_buckets_sec']}) | Emotion: {args.emotion} | "
-        f"100% Scene-Locked LUTs ({angle_jump_fixes} Shot-Continuity Locks, {subspace_splits} Bimodal 2-Space Splits) | {zoomed_count} Zoomed Super-Res Boosts | "
-        f"{total_adjusts} Adjust sliders ({total_adjusts/max(len(summary),1):.1f}/video) | LutImportCfg indices: {promoted_indices}]"
+        f"100% Scene-Locked LUTs ({angle_jump_fixes} Shot-Continuity Locks, {subspace_splits} Bimodal 2-Space Splits, {cl_stats['closed_loop_trims']} Closed-Loop Pixel Trims) | "
+        f"Cut-to-Cut Spread dMid:{cl_stats['raw_cut_dmid']:.3f}->{cl_stats['grd_cut_dmid']:.3f} dNRB:{cl_stats['raw_cut_dnrb']:.3f}->{cl_stats['grd_cut_dnrb']:.3f} | "
+        f"{zoomed_count} Zoomed Super-Res Boosts | {total_adjusts} Adjust sliders ({total_adjusts/max(len(summary),1):.1f}/video) | LutImportCfg indices: {promoted_indices}]"
     )
     for c in clusters:
         cfg = c["scene_cfg"]
@@ -2091,15 +2228,6 @@ def main():
     comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
     cont_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_shot_continuity.jpg"
     try:
-        fcache_path = get_default_frames_cache_path(proj_dir)
-        frames_arr = None
-        if os.path.isfile(fcache_path):
-            try:
-                loaded_f = np.load(fcache_path, mmap_mode="r")
-                if len(loaded_f) == len(all_seg_tuples):
-                    frames_arr = loaded_f
-            except Exception:
-                frames_arr = None
         comp_pages = render_graded_comparison_sheet(
             all_seg_tuples, seg_records, clusters, lut_map, comp_jpg,
             proj_dir=proj_dir, optical_db=optical_db, seg_applied=seg_applied,

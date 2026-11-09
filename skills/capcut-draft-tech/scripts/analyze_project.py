@@ -150,41 +150,7 @@ def detect_source_models(all_seg_tuples: list, proj_dir: str) -> tuple[str, dict
     return project_model, clip_model_by_path, stats
 
 
-def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: float = 5.0, return_frame: bool = False):
-    """
-    Samples the segment midpoint inside [start_sec, start_sec + dur_sec] at 216x122 resolution
-    using a single low-contention `-threads 1` FFmpeg decode so parallel worker pools run 3.3x faster
-    and reuse the exact same decoded frame for contact sheets without re-running FFmpeg.
-    """
-    W, H = 216, 122
-    mid_ts = max(0.0, start_sec + 0.50 * dur_sec)
-    cmd = [
-        "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", f"{mid_ts:.2f}", "-i", video_path,
-        "-vf", f"scale={W}:{H}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
-    ]
-    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
-    if len(raw) < W * H * 3:
-        cmd_fb = [
-            "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", "0.1", "-i", video_path,
-            "-vf", f"scale={W}:{H}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
-        ]
-        raw = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
-
-    if len(raw) < W * H * 3:
-        fallback_m = {
-            "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.28, "p50": 0.27, "p75": 0.40, "p95": 0.62, "p99": 0.75,
-            "contrast": 0.57, "iqr_ratio": 0.45, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
-            "neutral_rb": 0.04, "neutral_gm": -0.008,
-            "gm": -0.012, "sat": 0.15, "hsv_s": 0.44, "sharp": 0.040, "hf_noise": 0.028,
-            "skin_rb": 0.16, "skin_sat": 0.34, "skin_hi": 0.50
-        }
-        if return_frame:
-            return fallback_m, np.zeros((H, W, 3), dtype=np.uint8)
-        return fallback_m
-
-    u8_frame = np.frombuffer(raw[:W * H * 3], dtype=np.uint8).reshape((H, W, 3)).copy()
-    arr = u8_frame.astype(np.float32) / 255.0
-
+def _measure_single_frame(arr: np.ndarray) -> dict:
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
     p1, p5, p25, p50, p75, p95, p99 = np.percentile(luma, [1, 5, 25, 50, 75, 95, 99])
@@ -237,17 +203,77 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
     sharp = float(0.5 * (gx + gy))
     blur = 0.25 * (luma[:-2, 1:-1] + luma[2:, 1:-1] + luma[1:-1, :-2] + luma[1:-1, 2:])
     hf_noise = float(np.std(luma[1:-1, 1:-1] - blur))
-    res_m = {
-        "p1": round(float(p1), 4), "p5": round(float(p5), 4), "p25": round(float(p25), 4),
-        "mid": round(float(mid), 4), "p50": round(float(p50), 4), "p75": round(float(p75), 4),
-        "p95": round(float(p95), 4), "p99": round(float(p99), 4), "contrast": round(float(contrast), 4),
-        "iqr_ratio": round(float(iqr_ratio), 4), "rb": round(float(rb), 4), "shd_rb": round(float(shd_rb), 4),
-        "mid_rb": round(float(mid_rb), 4), "hi_rb": round(float(hi_rb), 4),
-        "neutral_rb": round(float(neutral_rb), 4), "neutral_gm": round(float(neutral_gm), 4),
-        "gm": round(float(gm), 4), "sat": round(float(sat), 4), "hsv_s": round(float(hsv_s), 4),
-        "sharp": round(float(sharp), 4), "hf_noise": round(float(hf_noise), 4),
-        "skin_rb": round(float(skin_rb), 4), "skin_sat": round(float(skin_sat), 4), "skin_hi": round(float(skin_hi), 4),
+    return {
+        "p1": float(p1), "p5": float(p5), "p25": float(p25),
+        "mid": float(mid), "p50": float(p50), "p75": float(p75),
+        "p95": float(p95), "p99": float(p99), "contrast": float(contrast),
+        "iqr_ratio": float(iqr_ratio), "rb": float(rb), "shd_rb": float(shd_rb),
+        "mid_rb": float(mid_rb), "hi_rb": float(hi_rb),
+        "neutral_rb": float(neutral_rb), "neutral_gm": float(neutral_gm),
+        "gm": float(gm), "sat": float(sat), "hsv_s": float(hsv_s),
+        "sharp": float(sharp), "hf_noise": float(hf_noise),
+        "skin_rb": float(skin_rb), "skin_sat": float(skin_sat), "skin_hi": float(skin_hi),
     }
+
+
+def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: float = 5.0, return_frame: bool = False):
+    """
+    Samples 3 temporal points (20% Entry, 50% Center, 80% Exit) inside [start_sec, start_sec + dur_sec]
+    at 216x122 resolution in a SINGLE low-contention `-threads 1` FFmpeg pass:
+    - Computes the temporal median across the 3 frames to reject transient flashes, blinks, or pillar occlusions.
+    - Records `entry_mid`, `exit_mid`, `entry_nrb`, `exit_nrb`, and `intra_drift` so adjacent cut matching
+      knows how `Seg_{i-1}` exits (80%) and how `Seg_i` enters (20%).
+    - Returns the clean 50% center `uint8` frame for `/tmp/capcut_frames_<slug>.npy`.
+    """
+    W, H = 216, 122
+    f_bytes = W * H * 3
+    dur_safe = max(0.4, float(dur_sec))
+    t20 = max(0.0, start_sec + 0.20 * dur_safe)
+    span = max(0.20, 0.60 * dur_safe)
+    fps_val = 3.0 / span
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "1", "-v", "error",
+        "-ss", f"{t20:.2f}", "-t", f"{span + 0.15:.2f}", "-i", video_path,
+        "-vf", f"fps={fps_val:.4f},scale={W}:{H}", "-frames:v", "3",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+    ]
+    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    if len(raw) < f_bytes:
+        mid_ts = max(0.0, start_sec + 0.50 * dur_safe)
+        cmd_fb = [
+            "ffmpeg", "-nostdin", "-threads", "1", "-v", "error", "-ss", f"{mid_ts:.2f}", "-i", video_path,
+            "-vf", f"scale={W}:{H}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+        raw = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+    if len(raw) < f_bytes:
+        fallback_m = {
+            "p1": 0.02, "p5": 0.05, "p25": 0.14, "mid": 0.28, "p50": 0.27, "p75": 0.40, "p95": 0.62, "p99": 0.75,
+            "contrast": 0.57, "iqr_ratio": 0.45, "rb": 0.12, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
+            "neutral_rb": 0.04, "neutral_gm": -0.008,
+            "gm": -0.012, "sat": 0.15, "hsv_s": 0.44, "sharp": 0.040, "hf_noise": 0.028,
+            "skin_rb": 0.16, "skin_sat": 0.34, "skin_hi": 0.50,
+            "entry_mid": 0.28, "exit_mid": 0.28, "entry_nrb": 0.04, "exit_nrb": 0.04, "intra_drift": 0.0,
+        }
+        if return_frame:
+            return fallback_m, np.zeros((H, W, 3), dtype=np.uint8)
+        return fallback_m
+
+    n_frames = len(raw) // f_bytes
+    u8_stack = np.frombuffer(raw[:n_frames * f_bytes], dtype=np.uint8).reshape((n_frames, H, W, 3)).copy()
+    u8_frame = u8_stack[n_frames // 2]
+
+    per_frame_ms = [_measure_single_frame(u8_stack[i].astype(np.float32) / 255.0) for i in range(n_frames)]
+    res_m = {}
+    for k in per_frame_ms[0].keys():
+        res_m[k] = round(float(np.median([fm[k] for fm in per_frame_ms])), 4)
+
+    res_m["entry_mid"] = round(float(per_frame_ms[0]["mid"]), 4)
+    res_m["exit_mid"] = round(float(per_frame_ms[-1]["mid"]), 4)
+    res_m["entry_nrb"] = round(float(per_frame_ms[0]["neutral_rb"]), 4)
+    res_m["exit_nrb"] = round(float(per_frame_ms[-1]["neutral_rb"]), 4)
+    res_m["intra_drift"] = round(abs(float(per_frame_ms[-1]["mid"]) - float(per_frame_ms[0]["mid"])), 4)
+
     if return_frame:
         return res_m, u8_frame
     return res_m
