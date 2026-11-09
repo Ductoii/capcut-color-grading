@@ -47,7 +47,10 @@ All scripts and resources live inside this skill folder:
 
 ## 3. End-to-End 5-Step CLI & Visual Workflow
 
-> **CRITICAL RULE (YAGNI)**: Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session. Instead, inspect `/tmp/<Project>_raw_scenes.jpg`, write your AI Colorist direction to `/tmp/capcut_plan_<slug>.json`, pass `--plan /tmp/capcut_plan_<slug>.json` to `apply_grade.py`, and verify `/tmp/<Project>_graded_comparison.jpg`.
+> **CRITICAL RULES (YAGNI & < 3 MIN SPEED)**:
+> 1. Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session.
+> 2. Never run ad-hoc `python3 -c` commands or write Python generator scripts (`/tmp/build_plan_*.py`) to inspect `/tmp/capcut_metrics_<slug>.json` or build massive per-segment plans (`analyze_project.py` already prints the complete Scene Cluster table and renders `/tmp/<Project>_raw_scenes.jpg`).
+> 3. Key `scenes` in `/tmp/capcut_plan_<slug>.json` by **`base_location`** (e.g. `"LANE_DAY"`, `"ENTRY_EVENING"`, `"ROW_FINAL_NIGHT"`, `"BG1"`) or `cluster_id` (`"0"`, `"1"`) using `write_file` directly, and rely on `apply_grade.py`'s built-in **Scene-Locked 1-LUT-Per-Scene + Achromatic `neutral_rb` Continuity Solver** instead of hardcoding hundreds of segments.
 
 ```bash
 # Step 1: Analyze project, auto-detect model, map scenes, cache 17-metric scopes & render 3-shot strips

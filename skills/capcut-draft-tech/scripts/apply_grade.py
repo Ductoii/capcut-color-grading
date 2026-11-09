@@ -644,7 +644,7 @@ def select_scene_primary_lut_and_targets(
         optical_db, anchor, target_mid, lut_target_rb, target_gm, target_sat, fams, fb_lut,
         allow_bw=use_bw, allow_stylized=allow_stylized,
         target_p5=lut_target_p5, target_hi=lut_target_hi,
-        used_lut_counts=used_primary_luts, diversity_weight=0.016, is_primary=True,
+        used_lut_counts=used_primary_luts, diversity_weight=0.002, is_primary=True,
         regime=regime,
     )
 
@@ -905,6 +905,12 @@ def _remaining_scene_defect(raw_val: float, sim_anchor_val: float, target_val: f
     return sim_err if abs(sim_err) < abs(raw_err) else raw_err
 
 
+def _deadband(val: float, db: float) -> float:
+    if abs(val) <= db:
+        return 0.0
+    return val - (db if val > 0 else -db)
+
+
 def compute_shot_lut_and_adjustments(
     m: dict,
     scene_cfg: dict,
@@ -918,13 +924,13 @@ def compute_shot_lut_and_adjustments(
     seg_plan: dict = None,
 ) -> tuple[str, float, list, str]:
     """
-    Non-Canceling Two-Stage Controller:
-    - Stage 1 (zorder 2000): Uses Scene Primary LUT (`scene_cfg["lut"]`) on normal shots; switches to a
-      Counter-Balance Sibling LUT whenever a shot jumps in angle/lighting relative to `scene_anchor`.
-    - Stage 2 (zorder 8004): Computes Adjust = `SceneBaseline(model, anchor, target) + ShotContinuity(sim_shot - sim_anchor)`.
-      This preserves 100% of the Primary LUT's 35mm look on the scene anchor while locking all shots in the scene
-      to `sim_anchor` and eliminating model-specific defects (Grok glare/plastic skin, Omni milky blacks/green cast,
-      Seedance dark night shadows).
+    Scene-Locked Two-Stage Controller:
+    - Stage 1 (zorder 2000): Locks 100% of segments in a Scene Cluster to the exact same Scene Primary LUT
+      (`scene_cfg["lut"]`) so camera-angle cuts inside a scene never swap `.cube` 3D color matrices.
+    - Stage 2 (zorder 8004): Computes Adjust = `SceneBaseline(model, anchor, target) + AchromaticShotContinuity`.
+      Drives intra-scene `temperature` & `tone` strictly from achromatic `neutral_rb` / `neutral_gm` (with a 0.015
+      deadband) so background/costume color differences (e.g. red brick wall vs. white suit) never cause white-balance
+      swings between adjacent cuts, while smoothing genuine exposure/lighting jumps by ~65%.
     """
     seg_plan = seg_plan or {}
     p5 = m.get("p5", 0.05)
@@ -937,6 +943,7 @@ def compute_shot_lut_and_adjustments(
     gm = m.get("gm", -0.012)
     sat = m.get("sat", 0.15)
     neutral_rb = m.get("neutral_rb", rb * 0.45)
+    neutral_gm = m.get("neutral_gm", gm)
     skin_rb = m.get("skin_rb", rb + 0.06)
     skin_sat = m.get("skin_sat", 0.42)
     sharp = m.get("sharp", 0.035)
@@ -962,16 +969,16 @@ def compute_shot_lut_and_adjustments(
 
     # Measure intra-scene shot jump relative to scene_anchor
     d_mid_anchor = mid - scene_anchor.get("mid", mid)
-    d_rb_anchor = rb - scene_anchor.get("rb", rb)
-    d_p5_anchor = p5 - scene_anchor.get("p5", p5)
+    anc_nrb = scene_anchor.get("neutral_rb", scene_anchor.get("rb", rb) * 0.45)
+    anc_ngm = scene_anchor.get("neutral_gm", scene_anchor.get("gm", gm))
+    d_nrb_anchor = neutral_rb - anc_nrb
+    d_ngm_anchor = neutral_gm - anc_ngm
 
+    # Stage 1 (zorder 2000): Lock 100% of shots in the scene to Scene Primary LUT (unless overridden in seg_plan)
     lut_title = scene_cfg["lut"]
     base_val = scene_cfg["base_val"]
     prof_note = scene_cfg["profile"]
 
-    # Stage 1 (zorder 2000): Trigger Counter-Balance Sibling LUT when shot jumps relative to scene_anchor
-    jump_th_mid = 0.026 if eff_model in ("grok", "omni", "hybrid") else 0.032
-    jump_th_rb = 0.020 if eff_model in ("grok", "omni", "hybrid") else 0.024
     if seg_plan.get("lut"):
         if isinstance(seg_plan["lut"], (list, tuple)) and len(seg_plan["lut"]) == 2:
             lut_title, base_val = str(seg_plan["lut"][0]), float(seg_plan["lut"][1])
@@ -980,21 +987,13 @@ def compute_shot_lut_and_adjustments(
             if "lut_val" in seg_plan:
                 base_val = float(seg_plan["lut_val"])
         prof_note = f"{scene_cfg['profile']} [AI Shot Override]"
-    elif abs(d_mid_anchor) > jump_th_mid or abs(d_rb_anchor) > jump_th_rb or abs(d_p5_anchor) > 0.024:
-        fb = "DRAMATIC (14).cube" if d_mid_anchor < -0.038 else ("CINEMATIC  (27).cube" if d_rb_anchor > 0.028 else "SCC-rec709 (23).cube")
-        lut_title, base_val, shot_state = match_optimal_lut_by_video_simulation(
-            optical_db, m,
-            sim_anchor["sim_mid"], sim_anchor["sim_rb"], sim_anchor["sim_gm"], sim_anchor["sim_sat"],
-            ("CINEMATIC", "DRAMATIC", "FILM LOOK", "SCC-REC709", "SKINTONE", "MOOD", "ATMOSPHERIC"),
-            fb, target_p5=sim_anchor["sim_p5"], target_hi=sim_anchor["sim_hi"],
-            used_lut_counts=used_shot_luts, diversity_weight=0.008, is_primary=False,
-            regime=regime,
-        )
-        prof_note = f"{scene_cfg['profile']} [Angle-Jump Counter-Balance: {shot_state}]"
-    elif used_shot_luts is not None:
+    elif abs(d_nrb_anchor) > 0.020 or abs(d_mid_anchor) > 0.045:
+        prof_note = f"{scene_cfg['profile']} [Angle-Jump Continuity Dampened]"
+
+    if used_shot_luts is not None:
         used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
-    lut_val = round(base_val + clamp(-d_mid_anchor * 0.06, -0.015, 0.015), 3)
+    lut_val = round(base_val + clamp(-d_mid_anchor * 0.04, -0.010, 0.010), 3)
     if "lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple)):
         lut_val = round(float(seg_plan["lut_val"]), 3)
 
@@ -1006,90 +1005,106 @@ def compute_shot_lut_and_adjustments(
 
     # Decompose Stage 2 error into:
     #   (A) Un-corrected Scene Defect (0 when anchor was already healthy -> preserves LUT look!)
-    #   (B) Intra-Scene Shot Continuity Error (sim_shot - sim_anchor -> locks all shots in scene together!)
+    #   (B) Intra-Scene Shot Continuity Error (with deadbands so composition changes never cause color/exposure swings!)
+    preserve_warm = bool(scene_cfg.get("preserve_warm_props", False)) or (anc_nrb <= 0.082)
     scene_def_p5 = _remaining_scene_defect(scene_anchor.get("p5", p5), sim_anchor["sim_p5"], target_p5, deadband=0.008)
     scene_def_mid = _remaining_scene_defect(scene_anchor.get("mid", mid), sim_anchor["sim_mid"], target_mid, deadband=0.010)
     scene_def_hi = _remaining_scene_defect(scene_anchor.get("p95", p95), sim_anchor["sim_hi"], target_hi, deadband=0.015)
-    scene_def_rb = _remaining_scene_defect(scene_anchor.get("rb", rb), sim_anchor["sim_rb"], target_rb, deadband=0.008)
+    scene_def_rb = _remaining_scene_defect(scene_anchor.get("rb", rb), sim_anchor["sim_rb"], target_rb, deadband=0.010)
+    if preserve_warm:
+        scene_def_rb *= 0.30
     scene_def_gm = _remaining_scene_defect(scene_anchor.get("gm", gm), sim_anchor["sim_gm"], target_gm, deadband=0.005)
     scene_def_sat = _remaining_scene_defect(scene_anchor.get("sat", sat), sim_anchor["sim_sat"], target_sat, deadband=0.008)
 
-    shot_gain = 1.25 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
-    shot_err_p5 = (sim["sim_p5"] - sim_anchor["sim_p5"]) * shot_gain
-    shot_err_mid = (sim["sim_mid"] - sim_anchor["sim_mid"]) * shot_gain
-    shot_err_hi = (sim["sim_hi"] - sim_anchor["sim_hi"]) * shot_gain
-    shot_err_rb = (sim["sim_rb"] - sim_anchor["sim_rb"]) * shot_gain
-    shot_err_gm = (sim["sim_gm"] - sim_anchor["sim_gm"]) * shot_gain
-    shot_err_sat = (sim["sim_sat"] - sim_anchor["sim_sat"]) * shot_gain
+    shot_gain = 1.15 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
+    shot_err_p5 = _deadband(sim["sim_p5"] - sim_anchor["sim_p5"], 0.010) * shot_gain
+    shot_err_mid = _deadband(sim["sim_mid"] - sim_anchor["sim_mid"], 0.015) * shot_gain
+    shot_err_hi = _deadband(sim["sim_hi"] - sim_anchor["sim_hi"], 0.018) * shot_gain
+    shot_err_nrb = _deadband(d_nrb_anchor, 0.015) * shot_gain
+    shot_err_ngm = _deadband(d_ngm_anchor, 0.008) * shot_gain
+    shot_err_sat = _deadband(sim["sim_sat"] - sim_anchor["sim_sat"], 0.012) * shot_gain
 
-    nb_mid_diff = mid - local_neighbor_m.get("mid", mid)
-    nb_rb_diff = rb - local_neighbor_m.get("rb", rb)
-    nb_sat_diff = sat - local_neighbor_m.get("sat", sat)
-    nb_weight = 0.45 if force_neighbor_match else (0.30 if eff_model in ("grok", "omni", "hybrid") else 0.20)
+    nb_mid_diff = _deadband(mid - local_neighbor_m.get("mid", mid), 0.018)
+    nb_nrb_diff = _deadband(neutral_rb - local_neighbor_m.get("neutral_rb", anc_nrb), 0.015)
+    nb_sat_diff = _deadband(sat - local_neighbor_m.get("sat", sat), 0.015)
+    nb_weight = 0.22 if force_neighbor_match else 0.15
 
     adjust = []
 
     # 1. SHADOW (`shadow`, v3) — Open dark night shadows (`+0.02..+0.15`), anchor milky blacks (`-0.09..-0.01`)
-    res_p5 = scene_def_p5 + shot_err_p5
-    if res_p5 > 0:
-        raw_shd = -res_p5 * 1.30
+    if scene_def_p5 > 0:
+        raw_shd = -scene_def_p5 * 1.25 - shot_err_p5 * 0.65
     else:
-        raw_shd = -res_p5 * 2.25 + max(0.0, 0.150 - p25) * 0.45
+        raw_shd = -scene_def_p5 * 2.10 - shot_err_p5 * 0.65 + max(0.0, 0.145 - p25) * 0.35
     raw_shd += float(scene_cfg.get("shadow_bias", 0.0)) + float(seg_plan.get("shadow_offset", 0.0))
     shadow_val = non_zero_clamp(raw_shd, -0.09, 0.15, min_abs=0.01, default_sign=-1.0 if p5 > 0.085 else 1.0)
     adjust.append(("shadow", shadow_val))
 
     # 2. HIGHLIGHT (`highlight`, v3) — Tame Grok specular glare (`-0.04..-0.12`), keep Seedance highlights luminous
-    res_hi = scene_def_hi + shot_err_hi
     grok_glare_pull = -0.035 if (eff_model == "grok" and p95 > 0.66) else 0.0
-    raw_hl = -res_hi * 0.65 - max(0.0, p99 - 0.850) * 0.28 + grok_glare_pull
+    raw_hl = -scene_def_hi * 0.65 - shot_err_hi * 0.45 - max(0.0, p99 - 0.850) * 0.25 + grok_glare_pull
     raw_hl += float(scene_cfg.get("highlight_bias", 0.0)) + float(seg_plan.get("highlight_offset", 0.0))
     highlight_val = non_zero_clamp(raw_hl, -0.12, 0.08, min_abs=0.01, default_sign=-1.0 if p95 > 0.66 else 1.0)
     adjust.append(("highlight", highlight_val))
 
     # 3. BRIGHTNESS (`brightness`, v2) & LIGHT SENSATION (`light_sensation`, "")
-    res_mid = scene_def_mid + shot_err_mid
-    raw_br = -res_mid * 0.95 - nb_mid_diff * nb_weight + float(scene_cfg.get("bright_bias", 0.0)) + float(seg_plan.get("bright_offset", 0.0))
+    raw_br = (
+        -scene_def_mid * 0.85
+        - shot_err_mid * 0.50
+        - nb_mid_diff * nb_weight
+        + float(scene_cfg.get("bright_bias", 0.0))
+        + float(seg_plan.get("bright_offset", 0.0))
+    )
     bright_val = non_zero_clamp(raw_br, -0.11, 0.16, min_abs=0.01, default_sign=1.0 if mid < 0.34 else -1.0)
     adjust.append(("brightness", bright_val))
 
     base_ls = -0.015 if (eff_model == "grok" and c > 0.58) else (+0.012 if eff_model == "seedance" and mid < 0.42 else 0.0)
-    raw_ls = base_ls - res_mid * 0.28 - nb_mid_diff * 0.10
+    raw_ls = base_ls - scene_def_mid * 0.25 - shot_err_mid * 0.15
     light_sens_val = non_zero_clamp(raw_ls, -0.04, 0.05, min_abs=0.01, default_sign=1.0 if base_ls >= 0 else -1.0)
     adjust.append(("light_sensation", light_sens_val))
 
     # 4. CONTRAST (`contrast`, v3) — Soften harsh Grok glare (`-0.02..-0.05`), add crisp 35mm depth to Seedance/Omni (`+0.015..+0.04`)
     if eff_model == "grok":
-        base_con = -0.025 if c > 0.57 else +0.012
+        base_con = -0.022 if c > 0.57 else +0.012
     else:
         base_con = +0.022 if c < 0.62 else -0.015
     target_c = target_hi - target_p5
-    raw_con = base_con + (target_c - sim["sim_contrast"]) * 0.22 + float(scene_cfg.get("contrast_bias", 0.0)) + float(seg_plan.get("contrast_offset", 0.0))
+    raw_con = base_con + (target_c - sim_anchor["sim_contrast"]) * 0.18 + float(scene_cfg.get("contrast_bias", 0.0)) + float(seg_plan.get("contrast_offset", 0.0))
     contrast_val = non_zero_clamp(raw_con, -0.06, 0.05, min_abs=0.01, default_sign=1.0 if base_con >= 0 else -1.0)
     adjust.append(("contrast", contrast_val))
 
     # 5. TONE / TINT (`tone`, v3) — Positive shifts toward magenta (canceling Omni/Grok green cast `gm > 0`)
-    res_gm = scene_def_gm + shot_err_gm
-    raw_tone = res_gm * 2.10 + float(scene_cfg.get("tone_bias", 0.0)) + float(seg_plan.get("tone_offset", 0.0))
+    raw_tone = (scene_def_gm + shot_err_ngm) * 1.85 + float(scene_cfg.get("tone_bias", 0.0)) + float(seg_plan.get("tone_offset", 0.0))
     tone_val = non_zero_clamp(raw_tone, -0.05, 0.06, min_abs=0.01, default_sign=1.0 if gm >= -0.008 else -1.0)
     adjust.append(("tone", tone_val))
 
-    # 6. TEMPERATURE (`temperature`, v3) — Preserves Primary LUT warmth/coolness on anchor while locking shot-to-shot RB & cooling plastic skin
-    res_rb = scene_def_rb + shot_err_rb
-    preserve_warm = bool(scene_cfg.get("preserve_warm_props", False)) or (neutral_rb <= 0.082)
-    plastic_thresh = (0.245 if preserve_warm else 0.230) if eff_model == "grok" else 0.262
-    shot_plastic_excess = max(0.0, (skin_rb - plastic_thresh) * (0.35 if preserve_warm else 0.45)) if neutral_rb > 0.065 else 0.0
-    raw_temp = -res_rb * 1.40 - nb_rb_diff * nb_weight - shot_plastic_excess + float(scene_cfg.get("temp_bias", 0.0)) + float(seg_plan.get("temp_offset", 0.0))
-    default_temp_sign = 1.0 if regime in ("DAWN_DUSK_GOLD", "WARM_INT") and res_rb <= 0 else -1.0
-    temp_val = non_zero_clamp(raw_temp, -0.16, 0.16, min_abs=0.01, default_sign=default_temp_sign)
+    # 6. TEMPERATURE (`temperature`, v3) — Driven by achromatic `neutral_rb` so red brick walls / blue shirts never trigger false temperature swings!
+    plastic_thresh = (0.248 if preserve_warm else 0.232) if eff_model == "grok" else 0.262
+    shot_plastic_excess = max(0.0, (skin_rb - plastic_thresh) * 0.30) if neutral_rb > 0.075 else 0.0
+    raw_temp = (
+        -scene_def_rb * 1.15
+        - shot_err_nrb * 1.10
+        - nb_nrb_diff * nb_weight
+        - shot_plastic_excess
+        + float(scene_cfg.get("temp_bias", 0.0))
+        + float(seg_plan.get("temp_offset", 0.0))
+    )
+    default_temp_sign = 1.0 if regime in ("DAWN_DUSK_GOLD", "WARM_INT") and scene_def_rb <= 0 else -1.0
+    temp_val = non_zero_clamp(raw_temp, -0.14, 0.14, min_abs=0.01, default_sign=default_temp_sign)
     adjust.append(("temperature", temp_val))
 
-    # 7. SATURATION (`saturation`, v1) — Clean 35mm color density; tames Grok oversaturated orange skin (`skin_sat > 0.47`)
-    res_sat = scene_def_sat + shot_err_sat
-    shot_sat_excess = max(0.0, (skin_sat - 0.475) * 0.26) if eff_model == "grok" else max(0.0, (skin_sat - 0.540) * 0.22)
-    raw_sat = -res_sat * 1.15 - nb_sat_diff * (nb_weight * 0.5) - shot_sat_excess + float(scene_cfg.get("sat_bias", 0.0)) + float(seg_plan.get("sat_offset", 0.0))
-    default_sat_sign = -1.0 if (eff_model == "grok" or res_sat > 0) else 1.0
-    sat_val = non_zero_clamp(raw_sat, -0.10, 0.08, min_abs=0.01, default_sign=default_sat_sign)
+    # 7. SATURATION (`saturation`, v1) — Clean 35mm color density; tames Grok oversaturated orange skin (`skin_sat > 0.48`)
+    shot_sat_excess = max(0.0, (skin_sat - 0.485) * 0.22) if eff_model == "grok" else max(0.0, (skin_sat - 0.540) * 0.20)
+    raw_sat = (
+        -scene_def_sat * 1.05
+        - shot_err_sat * 0.55
+        - nb_sat_diff * nb_weight
+        - shot_sat_excess
+        + float(scene_cfg.get("sat_bias", 0.0))
+        + float(seg_plan.get("sat_offset", 0.0))
+    )
+    default_sat_sign = -1.0 if (eff_model == "grok" or scene_def_sat > 0) else 1.0
+    sat_val = non_zero_clamp(raw_sat, -0.09, 0.08, min_abs=0.01, default_sign=default_sat_sign)
     adjust.append(("saturation", sat_val))
 
     # 8. MODEL-AWARE 35MM OPTICAL SHARPNESS (`sharpen`, `clear`, `particle`) + ZOOMED SUPER-RES BOOST
@@ -1210,10 +1225,17 @@ def apply_3d_lut_and_adjust_to_rgb(rgb: np.ndarray, lut_path: str, lut_val: floa
     return np.clip(out, 0.0, 1.0)
 
 
-def _measure_rgb_mid_rb(rgb: np.ndarray) -> tuple[float, float]:
-    luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-    rb = float(np.mean(rgb[..., 0] - rgb[..., 2]))
-    return float(np.median(luma)), rb
+def _measure_rgb_mid_rb(rgb: np.ndarray) -> tuple[float, float, float]:
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    rb_map = r - b
+    rb = float(np.mean(rb_map))
+    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+    valid = (luma >= 0.06) & (luma <= 0.90)
+    th = max(0.065, float(np.percentile(chroma[valid], 30)) if np.any(valid) else 0.08)
+    nmask = valid & (chroma <= th)
+    nrb = float(np.mean(rb_map[nmask])) if np.sum(nmask) >= 16 else rb * 0.45
+    return float(np.median(luma)), rb, nrb
 
 
 def render_graded_comparison_sheet(
@@ -1259,9 +1281,9 @@ def render_graded_comparison_sheet(
                 clip_model=rec.get("clip_model", cfg.get("project_model", "seedance")),
             )
         graded_rgb = apply_3d_lut_and_adjust_to_rgb(raw_rgb, lut_map.get(lut_title, ""), lut_val, adj_list)
-        r_mid, r_rb = _measure_rgb_mid_rb(raw_rgb)
-        g_mid, g_rb = _measure_rgb_mid_rb(graded_rgb)
-        return s_idx, raw_rgb, graded_rgb, lut_title, lut_val, r_mid, r_rb, g_mid, g_rb
+        r_mid, r_rb, r_nrb = _measure_rgb_mid_rb(raw_rgb)
+        g_mid, g_rb, g_nrb = _measure_rgb_mid_rb(graded_rgb)
+        return s_idx, raw_rgb, graded_rgb, lut_title, lut_val, r_mid, r_rb, r_nrb, g_mid, g_rb, g_nrb
 
     def _render_strip(idx_c):
         idx, c = idx_c
@@ -1281,27 +1303,27 @@ def render_graded_comparison_sheet(
         y0 = r_i * tile_h + 6
         draw.rectangle([x0 - 2, y0, x0 + strip_w - 6, y0 + tile_h - 4], fill=(24, 24, 28), outline=(56, 62, 70))
 
-        a_idx, a_raw, a_grd, a_lut, a_val, ar_m, ar_rb, ag_m, ag_rb = anc_res
-        o_idx, o_raw, o_grd, o_lut, o_val, or_m, or_rb, og_m, og_rb = out_res
+        a_idx, a_raw, a_grd, a_lut, a_val, ar_m, ar_rb, ar_nrb, ag_m, ag_rb, ag_nrb = anc_res
+        o_idx, o_raw, o_grd, o_lut, o_val, or_m, or_rb, or_nrb, og_m, og_rb, og_nrb = out_res
 
         raw_d_mid = abs(or_m - ar_m)
-        raw_d_rb = abs(or_rb - ar_rb)
+        raw_d_nrb = abs(or_nrb - ar_nrb)
         grd_d_mid = abs(og_m - ag_m)
-        grd_d_rb = abs(og_rb - ag_rb)
+        grd_d_nrb = abs(og_nrb - ag_nrb)
 
         reg_lbl = c.get("regime", "")[:12]
-        note_str = f" [{c['scene_cfg'].get('ai_note','')[:20]}]" if c["scene_cfg"].get("ai_note") else ""
+        note_str = f" [{c['scene_cfg'].get('ai_note','')[:18]}]" if c["scene_cfg"].get("ai_note") else ""
         hdr = (
             f"S{c['cluster_id']:02d} ({c['bg_code'][:15]}|{reg_lbl}) -> {a_lut[:18]} ({int(a_val*100)}%){note_str} | "
-            f"Spread dMid:{raw_d_mid:.2f}->{grd_d_mid:.2f} dRB:{raw_d_rb:.2f}->{grd_d_rb:.2f}"
+            f"Spread dMid:{raw_d_mid:.2f}->{grd_d_mid:.2f} dNRB:{raw_d_nrb:.2f}->{grd_d_nrb:.2f}"
         )
         draw.text((x0 + 4, y0 + 5), hdr, fill=(160, 245, 175))
 
         tiles = [
-            (a_raw, f"1.Anc RAW #{a_idx} M:{ar_m:.2f} RB:{ar_rb:+.2f}", (210, 210, 215)),
-            (a_grd, f"2.Anc GRD #{a_idx} M:{ag_m:.2f} RB:{ag_rb:+.2f}", (155, 245, 175)),
-            (o_raw, f"3.Out RAW #{o_idx} M:{or_m:.2f} RB:{or_rb:+.2f}", (245, 205, 155)),
-            (o_grd, f"4.Out GRD #{o_idx} M:{og_m:.2f} RB:{og_rb:+.2f} ({o_lut[:10]})", (155, 235, 250)),
+            (a_raw, f"1.Anc RAW #{a_idx} M:{ar_m:.2f} NRB:{ar_nrb:+.2f}", (210, 210, 215)),
+            (a_grd, f"2.Anc GRD #{a_idx} M:{ag_m:.2f} NRB:{ag_nrb:+.2f}", (155, 245, 175)),
+            (o_raw, f"3.Out RAW #{o_idx} M:{or_m:.2f} NRB:{or_nrb:+.2f}", (245, 205, 155)),
+            (o_grd, f"4.Out GRD #{o_idx} M:{og_m:.2f} NRB:{og_nrb:+.2f} ({o_lut[:10]})", (155, 235, 250)),
         ]
         for t_i, (arr, sub_lbl, col_txt) in enumerate(tiles):
             tx = x0 + t_i * (w + 3)
@@ -1694,7 +1716,10 @@ def main():
 
             force_nb = (mname in explicit_match) or bool(scfg.get("force_anchor_match")) or (
                 args.auto_match_outliers
-                and (abs(m["rb"] - scene_anchor["rb"]) > 0.035 or abs(m["mid"] - scene_anchor["mid"]) > 0.045)
+                and (
+                    abs(m.get("neutral_rb", 0.0) - scene_anchor.get("neutral_rb", 0.0)) > 0.022
+                    or abs(m["mid"] - scene_anchor["mid"]) > 0.045
+                )
             )
             lut_title, val, adj_list, prof = compute_shot_lut_and_adjustments(
                 m, scene_cfg, scene_anchor, local_nb_m, force_nb,
@@ -1764,7 +1789,7 @@ def main():
     print(
         f"Graded {len(summary)} child video segments across {len(clusters)} Scene Clusters ({mode_str}) in '{os.path.basename(proj_dir)}' "
         f"[Model: {project_model.upper()} (buckets={model_stats['duration_buckets_sec']}) | Emotion: {args.emotion} | "
-        f"{angle_jump_fixes} Angle-Jump Sibling LUT fixes | {zoomed_count} Zoomed Super-Res Boosts | "
+        f"100% Scene-Locked LUTs ({angle_jump_fixes} Achromatic Shot-Continuity Locks) | {zoomed_count} Zoomed Super-Res Boosts | "
         f"{total_adjusts} Adjust sliders ({total_adjusts/max(len(summary),1):.1f}/video) | LutImportCfg indices: {promoted_indices}]"
     )
     for c in clusters:
