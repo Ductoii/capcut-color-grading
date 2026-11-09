@@ -865,18 +865,30 @@ def assign_unified_scene_targets(
         group_primary[gkey] = (loc_anchor, group_cfg)
 
     # Second pass: compute per-cluster scene_anchor & scene_cfg (sharing the location group's Primary LUT)
-    loc_blend_mid = 0.30 if project_model in ("grok", "omni", "hybrid") else 0.15
-    loc_blend_rb = 0.35 if project_model in ("grok", "omni", "hybrid") else 0.22
+    loc_blend_mid = 0.35 if project_model in ("grok", "omni", "hybrid") else 0.20
+    loc_blend_rb = 0.40 if project_model in ("grok", "omni", "hybrid") else 0.25
 
     for c in clusters:
         loc_anchor, group_cfg = group_primary[c["_group_key"]]
+        g_clusters = loc_groups[c["_group_key"]]
         own = c["anchor"]
         scene_anchor = dict(own)
-        # Only blend mid/rb toward loc_anchor if they are in the same general lighting ballpark (not a deliberate light switch)
-        if abs(own["mid"] - loc_anchor["mid"]) <= 0.085:
-            scene_anchor["mid"] = round((1.0 - loc_blend_mid) * own["mid"] + loc_blend_mid * loc_anchor["mid"], 4)
-        if abs(own["rb"] - loc_anchor["rb"]) <= 0.065:
-            scene_anchor["rb"] = round((1.0 - loc_blend_rb) * own["rb"] + loc_blend_rb * loc_anchor["rb"], 4)
+        # For short intercut clusters (<= 3 segs, e.g. A -> B -> A -> B cross-cutting between 2 spaces),
+        # lock strongly (85%) to `loc_anchor` so all `A` cuts match each other and all `B` cuts match each other!
+        is_short_intercut = len(g_clusters) > 1 and len(c["seg_indices"]) <= 3
+        eff_blend_mid = 0.85 if is_short_intercut else loc_blend_mid
+        eff_blend_rb = 0.85 if is_short_intercut else loc_blend_rb
+        max_mid_gap = 0.165 if is_short_intercut else 0.095
+        max_rb_gap = 0.110 if is_short_intercut else 0.070
+
+        if abs(own["mid"] - loc_anchor["mid"]) <= max_mid_gap:
+            for k in ("p1", "p5", "p25", "mid", "p50", "p75", "p95", "p99"):
+                if k in own and k in loc_anchor:
+                    scene_anchor[k] = round((1.0 - eff_blend_mid) * own[k] + eff_blend_mid * loc_anchor[k], 4)
+        if abs(own["rb"] - loc_anchor["rb"]) <= max_rb_gap:
+            for k in ("rb", "shd_rb", "mid_rb", "hi_rb", "neutral_rb", "neutral_gm", "gm", "sat", "skin_rb", "skin_sat"):
+                if k in own and k in loc_anchor:
+                    scene_anchor[k] = round((1.0 - eff_blend_rb) * own[k] + eff_blend_rb * loc_anchor[k], 4)
 
         prog = 0.5 * (c["start_seg"] + c["end_seg"]) / total_segs
         cfg = select_scene_primary_lut_and_targets(
@@ -890,14 +902,94 @@ def assign_unified_scene_targets(
         cfg["base_val"] = group_cfg["base_val"]
         lut_entry = next((e for e in (optical_db or []) if e["title"] == cfg["lut"]), None)
         if lut_entry:
+            cfg["lut_entry"] = lut_entry
             cfg["sim_anchor"] = simulate_video_through_lut(scene_anchor, lut_entry, cfg["base_val"])
 
         # Apply AI Colorist scene-specific plan overrides (if any)
         sc_p = _get_sc_plan(c)
         _apply_ai_scene_plan_override(cfg, scene_anchor, sc_p, global_plan, optical_db)
+        lut_entry2 = next((e for e in (optical_db or []) if e["title"] == cfg["lut"]), None)
+        if lut_entry2:
+            cfg["lut_entry"] = lut_entry2
 
         c["unified_anchor"] = scene_anchor
         c["scene_cfg"] = cfg
+
+
+def partition_intra_scene_subspaces(clusters: list, seg_records: list, default_m: dict) -> int:
+    """
+    Detects when a single Scene Cluster actually contains 2 distinct lighting sub-spaces jumping
+    back and forth (`SubSpace-A` <-> `SubSpace-B`, e.g., dark alley vs. lit stall, shaded smoker vs.
+    sunny lane, or dark arena vs. bright judge spotlight table).
+    - Requires BOTH sub-spaces to have >= 2 segments (`len(A) >= 2` and `len(B) >= 2`), so a 1-shot
+      AI color/exposure glitch (`len == 1`) is NEVER mistaken for a second space and is instead pulled
+      tightly into the main space anchor.
+    - Requires a large physical separation (`|Mid_A - Mid_B| >= 0.115` or `|NeutRB_A - NeutRB_B| >= 0.058`)
+      and tight within-subspace cohesion (`within_var / total_var <= 0.42`).
+    """
+    split_count = 0
+    for c in clusters:
+        s_indices = c.get("seg_indices", [])
+        c["subspace_by_seg"] = {}
+        if len(s_indices) < 4:
+            continue
+        ms = [seg_records[i].get("metrics") or default_m for i in s_indices]
+        mids = np.array([float(m.get("mid", 0.30)) for m in ms])
+        nrbs = np.array([float(m.get("neutral_rb", m.get("rb", 0.12) * 0.45)) for m in ms])
+
+        best_split = None
+        # Check Axis 1: Exposure / Lighting Zone bimodality (`mid`) using optimal 1D 2-means split (requiring >= 2 segs per mode)
+        order_m = np.argsort(mids)
+        tot_var_m = float(np.var(mids)) + 1e-6
+        best_ratio_m = 1.0
+        for split_k in range(2, len(s_indices) - 1):
+            lo_pos, hi_pos = order_m[:split_k], order_m[split_k:]
+            vals_lo, vals_hi = mids[lo_pos], mids[hi_pos]
+            gap_mid = float(np.median(vals_hi)) - float(np.median(vals_lo))
+            if gap_mid < 0.125:
+                continue
+            w_var = (len(vals_lo) * float(np.var(vals_lo)) + len(vals_hi) * float(np.var(vals_hi))) / len(mids)
+            ratio = w_var / tot_var_m
+            if ratio <= 0.36 and ratio < best_ratio_m:
+                best_ratio_m = ratio
+                grp_lo = [s_indices[p] for p in lo_pos]
+                grp_hi = [s_indices[p] for p in hi_pos]
+                best_split = (grp_lo, grp_hi, f"2-Space Exposure Split (dMid={gap_mid:.2f})")
+
+        # Check Axis 2: Ambient Color Temperature bimodality (`neutral_rb`) if not already split
+        if best_split is None:
+            order_n = np.argsort(nrbs)
+            tot_var_n = float(np.var(nrbs)) + 1e-6
+            best_ratio_n = 1.0
+            for split_k in range(2, len(s_indices) - 1):
+                lo_pos, hi_pos = order_n[:split_k], order_n[split_k:]
+                vals_c, vals_w = nrbs[lo_pos], nrbs[hi_pos]
+                gap_nrb = float(np.median(vals_w)) - float(np.median(vals_c))
+                if gap_nrb < 0.062:
+                    continue
+                w_var = (len(vals_c) * float(np.var(vals_c)) + len(vals_w) * float(np.var(vals_w))) / len(nrbs)
+                ratio = w_var / tot_var_n
+                if ratio <= 0.36 and ratio < best_ratio_n:
+                    best_ratio_n = ratio
+                    grp_cool = [s_indices[p] for p in lo_pos]
+                    grp_warm = [s_indices[p] for p in hi_pos]
+                    best_split = (grp_cool, grp_warm, f"2-Space Color Split (dNRB={gap_nrb:.2f})")
+
+        if best_split is not None:
+            grp_a, grp_b, reason = best_split
+            base_anc = c.get("unified_anchor") or c["anchor"]
+            for lbl, grp in (("SubSpace-A", grp_a), ("SubSpace-B", grp_b)):
+                g_ms = [seg_records[i].get("metrics") or default_m for i in grp]
+                sub_anc = dict(base_anc)
+                for k in base_anc.keys():
+                    med_v = float(np.median([x.get(k, base_anc[k]) for x in g_ms]))
+                    # Keep 80% sub-space identity + 20% scene cohesion
+                    sub_anc[k] = round(0.80 * med_v + 0.20 * float(base_anc[k]), 4)
+                for s_idx in grp:
+                    c["subspace_by_seg"][s_idx] = (sub_anc, grp, f"{lbl}:{reason}")
+            c["has_subspaces"] = reason
+            split_count += 1
+    return split_count
 
 
 def _remaining_scene_defect(raw_val: float, sim_anchor_val: float, target_val: float, deadband: float = 0.010) -> float:
@@ -953,6 +1045,7 @@ def compute_shot_lut_and_adjustments(
     p99 = m.get("p99", 0.76)
     c = m.get("contrast", 0.55)
     rb = m.get("rb", 0.13)
+    shd_rb = m.get("shd_rb", rb * 0.5)
     gm = m.get("gm", -0.012)
     sat = m.get("sat", 0.15)
     neutral_rb = m.get("neutral_rb", rb * 0.45)
@@ -968,21 +1061,45 @@ def compute_shot_lut_and_adjustments(
     anc_mid = scene_anchor.get("mid", mid)
     anc_p95 = scene_anchor.get("p95", p95)
     anc_rb = scene_anchor.get("rb", rb)
+    anc_shd_rb = scene_anchor.get("shd_rb", anc_rb * 0.5)
     anc_gm = scene_anchor.get("gm", gm)
     anc_sat = scene_anchor.get("sat", sat)
     anc_nrb = scene_anchor.get("neutral_rb", anc_rb * 0.45)
     anc_ngm = scene_anchor.get("neutral_gm", anc_gm)
+    anc_skin_rb = scene_anchor.get("skin_rb", skin_rb)
 
-    # Measure intra-scene shot jump relative to scene_anchor
-    d_mid = mid - anc_mid
-    d_nrb = neutral_rb - anc_nrb
-    d_ngm = neutral_gm - anc_ngm
-    d_sat = sat - anc_sat
+    # Blend Sub-Space Anchor (65%) with Immediate Same-Subspace Neighbor (35%) for smooth cut-to-cut transitions
+    nb = local_neighbor_m or scene_anchor
+    nb_w = 0.35 if (abs(mid - anc_mid) <= 0.085 and abs(neutral_rb - anc_nrb) <= 0.042) else 0.15
+    ref_mid = (1.0 - nb_w) * anc_mid + nb_w * nb.get("mid", anc_mid)
+    ref_nrb = (1.0 - nb_w) * anc_nrb + nb_w * nb.get("neutral_rb", anc_nrb)
+    ref_ngm = (1.0 - nb_w) * anc_ngm + nb_w * nb.get("neutral_gm", anc_ngm)
+    ref_skin_rb = (1.0 - nb_w) * anc_skin_rb + nb_w * nb.get("skin_rb", anc_skin_rb)
+    ref_shd_rb = (1.0 - nb_w) * anc_shd_rb + nb_w * nb.get("shd_rb", anc_shd_rb)
+    ref_sat = (1.0 - nb_w) * anc_sat + nb_w * nb.get("sat", anc_sat)
 
-    # Stage 1 (zorder 2000): Lock 100% of shots in the scene to Scene Primary LUT & intensity (unless overridden in seg_plan)
+    # Measure intra-space shot jump relative to blended reference (`ref_*`)
+    d_mid = mid - ref_mid
+    d_nrb = neutral_rb - ref_nrb
+    d_skin_rb = skin_rb - ref_skin_rb
+    d_shd_rb = shd_rb - ref_shd_rb
+    d_ngm = neutral_gm - ref_ngm
+    d_sat = sat - ref_sat
+
+    # Multi-Cue Illumination & Skin Probe:
+    # When both neutral pixels (`d_nrb`) AND human skin (`d_skin_rb`) or shadows (`d_shd_rb`) shift in the same direction,
+    # it is a genuine AI clip-to-clip color temperature shift (even on close-ups with few gray pixels).
+    # When they disagree (e.g. only background wall/costume changed), rely strictly on achromatic `d_nrb`.
+    if (d_nrb * d_skin_rb > 0.0002) or abs(d_nrb) > 0.024:
+        d_illum_rb = 0.55 * d_nrb + 0.28 * clamp(d_skin_rb, -0.09, 0.09) + 0.17 * clamp(d_shd_rb, -0.08, 0.08)
+    else:
+        d_illum_rb = d_nrb
+
+    # Stage 1 (zorder 2000): Lock 100% of shots in the scene to Scene Primary LUT (with micro-adaptive strength ±2.5% when LUT amplifies a clip defect)
     lut_title = scene_cfg["lut"]
     base_val = scene_cfg["base_val"]
     prof_note = scene_cfg["profile"]
+    lut_entry = scene_cfg.get("lut_entry")
 
     if seg_plan.get("lut"):
         if isinstance(seg_plan["lut"], (list, tuple)) and len(seg_plan["lut"]) == 2:
@@ -992,13 +1109,27 @@ def compute_shot_lut_and_adjustments(
             if "lut_val" in seg_plan:
                 base_val = float(seg_plan["lut_val"])
         prof_note = f"{scene_cfg['profile']} [AI Shot Override]"
-    elif abs(d_nrb) > 0.025 or abs(d_mid) > 0.055:
+    elif abs(d_illum_rb) > 0.025 or abs(d_mid) > 0.055:
         prof_note = f"{scene_cfg['profile']} [Angle-Jump Continuity Dampened]"
 
     if used_shot_luts is not None:
         used_shot_luts[lut_title] = used_shot_luts.get(lut_title, 0) + 1
 
-    lut_val = round(float(seg_plan["lut_val"]) if ("lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple))) else base_val, 3)
+    if "lut_val" in seg_plan and not isinstance(seg_plan.get("lut"), (list, tuple)):
+        lut_val = round(float(seg_plan["lut_val"]), 3)
+    else:
+        lut_mod = 0.0
+        if lut_entry is not None:
+            lut_rb_push = float(lut_entry.get("midRB", 0.0))
+            lut_mid_push = float(lut_entry.get("mid", 0.3333)) - 0.3333
+            # If the LUT pushes warmth/brightness in the same direction as the clip's excess error, trim strength by 1-2.5%
+            if d_illum_rb * lut_rb_push > 0.0008:
+                lut_mod -= clamp(abs(d_illum_rb) * 0.35, 0.010, 0.025)
+            if d_mid * lut_mid_push > 0.0010:
+                lut_mod -= clamp(abs(d_mid) * 0.25, 0.010, 0.020)
+        lut_val = round(clamp(base_val + lut_mod, 0.14, 0.26), 3)
+
+    eff_d_mid = d_mid
 
     # Stage 2 (zorder 8004): Bounded Scene Baselines + Coherent Two-Tier Shot Continuity
     preserve_warm = bool(scene_cfg.get("preserve_warm_props", False)) or (anc_nrb <= 0.082)
@@ -1044,21 +1175,26 @@ def compute_shot_lut_and_adjustments(
         # Natural lighting (any warm RB is from brick walls, wood, or costumes)
         b_tp = +0.01 if regime == "DAWN_DUSK_GOLD" else -0.01
 
-    # (B) Coherent Two-Tier Intra-Scene Shot Continuity (`d_mid` and `d_nrb`)
-    shot_gain = 1.12 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
-    if abs(d_mid) <= 0.075:
-        br_corr = -d_mid * 0.48 * shot_gain
-        shd_corr = -d_mid * 0.30 * shot_gain
-        hl_corr = -d_mid * 0.25 * shot_gain
+    # (B) Continuous Piecewise-Linear Two-Tier Shot Continuity (`eff_d_mid` and `d_illum_rb`)
+    # Avoids any step-cliff at 0.075 while strongly pulling genuine lighting/exposure outliers (> 0.075) back to anchor.
+    shot_gain = 1.10 if (force_neighbor_match or seg_plan.get("force_anchor_match")) else 1.0
+    if abs(eff_d_mid) <= 0.075:
+        br_corr = -eff_d_mid * 0.48 * shot_gain
+        shd_corr = -eff_d_mid * 0.30 * shot_gain
+        hl_corr = -eff_d_mid * 0.25 * shot_gain
     else:
-        br_corr = -d_mid * 0.82 * shot_gain
-        shd_corr = -d_mid * 0.58 * shot_gain
-        hl_corr = -d_mid * 0.50 * shot_gain
+        sgn_m = 1.0 if eff_d_mid > 0 else -1.0
+        exc_m = eff_d_mid - sgn_m * 0.075
+        br_corr = -(sgn_m * 0.075 * 0.48 + exc_m * 1.15) * shot_gain
+        shd_corr = -(sgn_m * 0.075 * 0.30 + exc_m * 0.85) * shot_gain
+        hl_corr = -(sgn_m * 0.075 * 0.25 + exc_m * 0.75) * shot_gain
 
-    if abs(d_nrb) <= 0.032:
-        tp_corr = -d_nrb * 0.35 * shot_gain
+    if abs(d_illum_rb) <= 0.032:
+        tp_corr = -d_illum_rb * 0.38 * shot_gain
     else:
-        tp_corr = -d_nrb * 0.85 * shot_gain
+        sgn_r = 1.0 if d_illum_rb > 0 else -1.0
+        exc_r = d_illum_rb - sgn_r * 0.032
+        tp_corr = -(sgn_r * 0.032 * 0.38 + exc_r * 1.10) * shot_gain
 
     adjust = []
 
@@ -1802,6 +1938,14 @@ def main():
         allow_bw=args.allow_bw, allow_stylized=args.allow_stylized,
         custom_plan=custom_plan,
     )
+    default_m = {
+        "p5": 0.05, "p25": 0.15, "mid": 0.28, "p95": 0.62, "p99": 0.76, "contrast": 0.55,
+        "rb": 0.13, "shd_rb": 0.06, "mid_rb": 0.13, "hi_rb": 0.15,
+        "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "neutral_rb": 0.045, "neutral_gm": -0.008,
+        "skin_rb": 0.20, "skin_gm": -0.025, "skin_sat": 0.42, "sharp": 0.042, "hf_noise": 0.030,
+    }
+    subspace_splits = partition_intra_scene_subspaces(clusters, seg_records, default_m)
+
     seg_to_cluster = {}
     for c in clusters:
         for s_idx in c["seg_indices"]:
@@ -1809,11 +1953,6 @@ def main():
 
     explicit_match = {x.strip() for x in args.match_clips.split(",") if x.strip()}
     plan_segs = custom_plan.get("segments", {}) or {}
-    default_m = {
-        "p5": 0.05, "p25": 0.15, "mid": 0.28, "p95": 0.62, "p99": 0.76, "contrast": 0.55,
-        "rb": 0.13, "gm": -0.012, "sat": 0.15, "hsv_s": 0.45, "neutral_rb": 0.045, "neutral_gm": -0.008,
-        "skin_rb": 0.20, "skin_gm": -0.025, "skin_sat": 0.42, "sharp": 0.042, "hf_noise": 0.030,
-    }
 
     summary = []
     seg_applied = {}
@@ -1832,8 +1971,15 @@ def main():
         if seg_scale > 1.02:
             zoomed_count += 1
         c_info = seg_to_cluster[idx]
-        scene_anchor = c_info.get("unified_anchor") or c_info["anchor"]
+        base_scene_anchor = c_info.get("unified_anchor") or c_info["anchor"]
         scene_cfg = c_info["scene_cfg"]
+
+        # Check if this segment belongs to a bimodal Sub-Space (A <-> B intercutting inside one scene)
+        sub_entry = c_info.get("subspace_by_seg", {}).get(idx)
+        if sub_entry is not None:
+            scene_anchor, c_indices, sub_lbl = sub_entry
+        else:
+            scene_anchor, c_indices, sub_lbl = base_scene_anchor, c_info["seg_indices"], ""
 
         scfg = plan_segs.get(str(idx)) or plan_segs.get(mname) or {}
         if scfg and "adjust" in scfg and "lut" in scfg and isinstance(scfg["lut"], (list, tuple)):
@@ -1841,11 +1987,16 @@ def main():
             lut_title, val = scfg["lut"]
             prof = scfg.get("profile", "Custom Plan")
         else:
-            c_indices = c_info["seg_indices"]
-            nb_ms = [seg_records[j].get("metrics") or default_m for j in c_indices if abs(j - idx) <= 2 and j != idx]
+            # Select healthy immediate neighbors in the SAME sub-space (excluding extreme 1-shot glitches)
+            nb_ms = []
+            for j in c_indices:
+                if j != idx and abs(j - idx) <= 3:
+                    mj = seg_records[j].get("metrics") or default_m
+                    if abs(mj.get("mid", 0.3) - scene_anchor.get("mid", 0.3)) <= 0.095 and abs(mj.get("neutral_rb", 0.04) - scene_anchor.get("neutral_rb", 0.04)) <= 0.045:
+                        nb_ms.append(mj)
             if not nb_ms:
                 nb_ms = [scene_anchor]
-            local_nb_m = {k: float(np.mean([x.get(k, m.get(k, default_m[k])) for x in nb_ms])) for k in default_m}
+            local_nb_m = {k: float(np.mean([x.get(k, m.get(k, default_m.get(k, 0.0))) for x in nb_ms])) for k in default_m}
 
             force_nb = (mname in explicit_match) or bool(scfg.get("force_anchor_match")) or (
                 args.auto_match_outliers
@@ -1860,6 +2011,8 @@ def main():
                 clip_model=rec.get("clip_model", project_model),
                 seg_plan=scfg,
             )
+            if sub_lbl:
+                prof = f"{prof} [{sub_lbl}]"
             if "Angle-Jump" in prof:
                 angle_jump_fixes += 1
 
@@ -1922,16 +2075,17 @@ def main():
     print(
         f"Graded {len(summary)} child video segments across {len(clusters)} Scene Clusters ({mode_str}) in '{os.path.basename(proj_dir)}' "
         f"[Model: {project_model.upper()} (buckets={model_stats['duration_buckets_sec']}) | Emotion: {args.emotion} | "
-        f"100% Scene-Locked LUTs ({angle_jump_fixes} Achromatic Shot-Continuity Locks) | {zoomed_count} Zoomed Super-Res Boosts | "
+        f"100% Scene-Locked LUTs ({angle_jump_fixes} Shot-Continuity Locks, {subspace_splits} Bimodal 2-Space Splits) | {zoomed_count} Zoomed Super-Res Boosts | "
         f"{total_adjusts} Adjust sliders ({total_adjusts/max(len(summary),1):.1f}/video) | LutImportCfg indices: {promoted_indices}]"
     )
     for c in clusters:
         cfg = c["scene_cfg"]
         sa = c.get("unified_anchor") or c["anchor"]
+        sub_tag = f" [{c['has_subspaces']}]" if c.get("has_subspaces") else ""
         note_tag = f" | Note: {cfg['ai_note']}" if cfg.get("ai_note") else ""
         print(
             f"  - Scene[{c['cluster_id']:2d}] ({c['bg_code']:22s} | {c.get('regime',''):14s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
-            f"Primary LUT: {cfg['lut']:26s} ({cfg['base_val']*100:.0f}%) | Raw Mid={sa['mid']:.2f} RB={sa['rb']:+.2f} NeutRB={sa.get('neutral_rb',0):+.2f} -> Target Mid={cfg['target_mid']:.2f} RB={cfg['target_rb']:+.2f}{note_tag}"
+            f"Primary LUT: {cfg['lut']:26s} ({cfg['base_val']*100:.0f}%) | Raw Mid={sa['mid']:.2f} RB={sa['rb']:+.2f} NeutRB={sa.get('neutral_rb',0):+.2f} -> Target Mid={cfg['target_mid']:.2f} RB={cfg['target_rb']:+.2f}{sub_tag}{note_tag}"
         )
 
     comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
