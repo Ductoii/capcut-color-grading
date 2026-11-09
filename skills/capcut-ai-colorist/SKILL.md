@@ -11,12 +11,14 @@ You are a **Senior DI (Digital Intermediate) Film Colorist** grading AI-generate
 - **Role Division (AI = Lead Colorist, Code = DI Scope & Console)**:
   - **You (the AI Colorist)** must **directly look at the visual frames of every scene** (`1.First | 2.Anchor | 3.Outlier` strips in `/tmp/<Project>_raw_scenes.jpg`) alongside the screenplay (`BANGTRA` / `PROMPT_ANH_REF` / `sf-board.json`), diagnose real lighting vs. colorful props/costumes, author an explicit **Scene & Shot Grading Plan (`/tmp/capcut_plan_<slug>.json`)**, and visually verify the graded result (`/tmp/<Project>_graded_comparison.jpg`).
   - **The Python scripts (`analyze_project.py` & `apply_grade.py` in `capcut-draft-tech`)** act as your precision DaVinci/CapCut DI console: measuring 17 scope metrics at exact `source_timerange`, simulating 1,636 3D `.cube` LUTs with CapCut's `tt_skin_seg` skin protection (`enable_skin_tone_correction: true`), solving shot-to-shot continuity within each scene around your chosen look, and writing all CapCut draft mirrors.
-- **100% End-to-End Execution & Fast Turnaround (< 3 Minutes Total, Zero User Questions)**:
+- **100% End-to-End Execution & 10–20 Minute Professional DI Time Budget (Zero User Questions)**:
   - Never stop to ask the user questions (no intake prompts, no confirmation pauses). Execute the entire 5-step visual grading workflow from start to finish in one go and deliver the final best graded project directly.
-  - **Strict Speed & Simplicity Guardrails**:
+  - **Target Time Budget (`10–20 Minutes`, Strictly `<= 20 Minutes`)**:
+    - Spend your time budget on **real, thorough visual colorist work**: reading the screenplay context (`KICHBAN` / `BANGTRA` / `PROMPT_ANH_REF` / `sf-board.json`), calling `read_file` on **every high-resolution paginated Scene Strip page** (`/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`...) so no scene or shot is downscaled/blurry, designing a thoughtful scene & outlier-shot plan (`/tmp/capcut_plan_<slug>.json`), and visually inspecting **every paginated Before/After QA page** (`/tmp/<Project>_graded_comparison_p1.jpg`, `_p2.jpg`...) with a refinement pass if any scene or cut needs tuning.
+  - **Strict Continuity & Efficiency Guardrails (Avoid Wasting Time on Bugs)**:
     1. **100% Scene-Locked LUT**: Every segment inside a Scene Cluster uses the **exact same Primary 35mm `.cube` LUT** (`scene_cfg["lut"]`). Never swap `.cube` LUTs from cut to cut inside a scene!
     2. **Achromatic `neutral_rb` Shot Continuity**: Intra-scene `temperature` adjustments are driven strictly by `neutral_rb` differences (`dNeutRB`, with a `0.015` deadband), never by whole-frame `rb` (which varies with red brick walls, blue shirts, or colorful props depending on camera angle).
-    3. **Concise Scene-Level `--plan` JSON Only**: Write `/tmp/capcut_plan_<slug>.json` directly using `write_file` with **scene-level entries (`scenes`, keyed by `cluster_id` or `base_location` like `"LANE_DAY"`, `"ENTRY_EVENING"`, `"ROW_FINAL_NIGHT"`)** and at most `3–8` extreme outlier segment overrides (`segments`). **NEVER** write ad-hoc Python scripts (`python3 -c` or `/tmp/build_plan_*.py`) to parse `/tmp/capcut_metrics_<slug>.json` or generate hundreds of per-segment overrides!
+    3. **Clean `--plan` JSON Authoring**: Write `/tmp/capcut_plan_<slug>.json` directly using `write_file` (keying `scenes` by `cluster_id` or `base_location` like `"LANE_DAY"`, `"ENTRY_EVENING"`, `"ROW_FINAL_NIGHT"`, and `segments` only for genuine lighting/exposure outliers). Never waste time on broken `python3 -c` escaping or overriding normal camera cuts that only differ in background/costume color!
 
 ---
 
@@ -60,11 +62,11 @@ python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scri
 - Auto-detects `SEEDANCE` / `GROK` / `OMNI` / `HYBRID` from source video durations.
 - Maps clips to ground-truth scenes (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `sf-board.json`), caches 17-metric segment scopes to `/tmp/capcut_metrics_<slug>.json`, and renders the **3-Shot Scene Strip Contact Sheet** at `/tmp/<Project>_raw_scenes.jpg`.
 
-### Step 2: Visually Inspect All Scene Strips (`read_file`) & Screenplay Context
-- Call `read_file` on `/tmp/<Project>_raw_scenes.jpg` to inspect every Scene Cluster's 3 representative shots side-by-side:
+### Step 2: Visually Inspect All High-Res Paginated Scene Strips (`read_file`) & Screenplay Context
+- Call `read_file` on `/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`... (or `/tmp/<Project>_raw_scenes.jpg` for short projects `<= 16` scenes) so you inspect every Scene Cluster's 3 representative shots at full, un-downscaled resolution:
   - **`1.First`** (opening shot of the scene),
   - **`2.Anchor`** (median reference shot of the scene),
-  - **`3.Outlier`** (the shot in the scene with the largest exposure/color jump `dMid` / `dRB` from the anchor).
+  - **`3.Outlier`** (the shot in the scene with the largest exposure/white-balance jump `dMid` / `dNRB` from the anchor).
 - Visually check each scene for:
   1. **True time-of-day & lighting mood** (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`) — verify whether keyword classification matched the actual visual scene (for example, an indoor VIP lounge or warm wooden courtroom vs. a cold server room).
   2. **Colorful props/costumes/backgrounds** (pink hats, red brick, warm wood, BBQ smoke, foliage) vs. true skin/ambient casts (`NeutRB`).
@@ -121,8 +123,8 @@ python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scri
 ```
 - Injects Stage 1 (`lut` at `zorder: 2000` with `enable_skin_tone_correction: true`) + Stage 2 (12 non-canceling Adjust sliders at `zorder: 8004`) onto every child video segment (`video con`), promotes active LUTs into `LutImportCfg.json[0:100]`, syncs `draft_info.json`, `mini_draft.json`, and Compound Clip `subdraft/*/draft_content.json`, and renders the **4-Tile Before/After Comparison Sheet** at `/tmp/<Project>_graded_comparison.jpg`.
 
-### Step 5: Visually Verify `/tmp/<Project>_graded_comparison.jpg` & Refine if Needed
-- Call `read_file` on `/tmp/<Project>_graded_comparison.jpg` to inspect all 4 tiles per scene (`1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD`) and check the header metrics (`Spread dMid: raw->grd dRB: raw->grd`):
-  - Confirm that `2.Anc GRD` and `4.Out GRD` match seamlessly in brightness and color temperature within every scene.
+### Step 5: Visually Verify All High-Res Paginated QA Sheets (`/tmp/<Project>_graded_comparison_p*.jpg`) & Refine if Needed
+- Call `read_file` on `/tmp/<Project>_graded_comparison_p1.jpg`, `_p2.jpg`... (or `/tmp/<Project>_graded_comparison.jpg` for short projects) to inspect all 4 tiles per scene (`1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD`) and check the header metrics (`Spread dMid: raw->grd dNRB: raw->grd`):
+  - Confirm that `2.Anc GRD` and `4.Out GRD` share the exact same Scene Primary LUT and match seamlessly in brightness (`dMid`) and achromatic white balance (`dNRB`) within every scene.
   - Confirm that skin tones look natural and 35mm-filmic across all acts without cyan/green sickness or plastic orange blowouts.
-  - If any scene or outlier shot needs further refinement after visual inspection, adjust `/tmp/capcut_plan_<slug>.json` and re-run `apply_grade.py --plan` immediately before finishing.
+  - If any scene or outlier shot needs further refinement after visual inspection, adjust `/tmp/capcut_plan_<slug>.json` and re-run `apply_grade.py --plan` immediately within the 10–20 minute budget before finishing.

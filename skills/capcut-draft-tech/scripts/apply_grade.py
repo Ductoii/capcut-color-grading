@@ -1332,6 +1332,21 @@ def render_graded_comparison_sheet(
             draw.text((tx + 3, ty + h + 3), sub_lbl, fill=col_txt)
 
     sheet.save(out_jpg, quality=88)
+    page_paths = [out_jpg]
+    if len(clusters) > 16:
+        page_rows = 7
+        page_h = page_rows * tile_h + 12
+        total_pages = (rows + page_rows - 1) // page_rows
+        base_no_ext = os.path.splitext(out_jpg)[0]
+        page_paths = []
+        for p_idx in range(total_pages):
+            y_start = p_idx * page_rows * tile_h
+            y_end = min(sheet.height, y_start + page_h)
+            crop_img = sheet.crop((0, y_start, sheet.width, y_end))
+            p_path = f"{base_no_ext}_p{p_idx + 1}.jpg"
+            crop_img.save(p_path, quality=90)
+            page_paths.append(p_path)
+    return page_paths
 
 
 MINI_DRAFT_ADJUST_SLOT_MAP = {
@@ -1803,11 +1818,13 @@ def main():
 
     comp_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_graded_comparison.jpg"
     try:
-        render_graded_comparison_sheet(
+        comp_pages = render_graded_comparison_sheet(
             all_seg_tuples, seg_records, clusters, lut_map, comp_jpg,
             proj_dir=proj_dir, optical_db=optical_db, seg_applied=seg_applied,
         )
         print(f"\n[MANDATORY AI VISUAL QA] Rendered RAW vs. GRADED comparison sheet in {time.time() - t0:.1f}s total: {comp_jpg}")
+        if len(comp_pages) > 1:
+            print(f"-> High-Res Paginated QA Sheets ({len(comp_pages)} pages): {', '.join(comp_pages)}")
     except Exception as exc:
         print(f"Note: Could not render graded comparison sheet ({exc})")
 

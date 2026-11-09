@@ -47,10 +47,10 @@ All scripts and resources live inside this skill folder:
 
 ## 3. End-to-End 5-Step CLI & Visual Workflow
 
-> **CRITICAL RULES (YAGNI & < 3 MIN SPEED)**:
-> 1. Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session.
-> 2. Never run ad-hoc `python3 -c` commands or write Python generator scripts (`/tmp/build_plan_*.py`) to inspect `/tmp/capcut_metrics_<slug>.json` or build massive per-segment plans (`analyze_project.py` already prints the complete Scene Cluster table and renders `/tmp/<Project>_raw_scenes.jpg`).
-> 3. Key `scenes` in `/tmp/capcut_plan_<slug>.json` by **`base_location`** (e.g. `"LANE_DAY"`, `"ENTRY_EVENING"`, `"ROW_FINAL_NIGHT"`, `"BG1"`) or `cluster_id` (`"0"`, `"1"`) using `write_file` directly, and rely on `apply_grade.py`'s built-in **Scene-Locked 1-LUT-Per-Scene + Achromatic `neutral_rb` Continuity Solver** instead of hardcoding hundreds of segments.
+> **CRITICAL RULES (YAGNI & 10–20 MINUTE PROFESSIONAL DI BUDGET)**:
+> 1. **Time Budget (`10–20 Minutes`, Strictly `<= 20 Minutes`)**: Dedicate the 10–20 minute window to thorough visual inspection of all high-resolution paginated scene strips (`/tmp/<Project>_raw_scenes_p*.jpg`), screenplay context, bespoke `--plan` authoring, and multi-page visual QA (`/tmp/<Project>_graded_comparison_p*.jpg`).
+> 2. Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session, and avoid fragile `python3 -c` escaping one-liners.
+> 3. Rely on `apply_grade.py`'s built-in **Scene-Locked 1-LUT-Per-Scene + Achromatic `neutral_rb` Continuity Solver**, keying `scenes` in `/tmp/capcut_plan_<slug>.json` by `base_location` or `cluster_id` and `segments` only for genuine lighting/exposure outliers.
 
 ```bash
 # Step 1: Analyze project, auto-detect model, map scenes, cache 17-metric scopes & render 3-shot strips

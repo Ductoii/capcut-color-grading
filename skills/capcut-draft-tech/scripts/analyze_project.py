@@ -840,6 +840,21 @@ def render_raw_scene_contact_sheet(all_seg_tuples: list, seg_records: list, clus
             sheet.paste(tile_img, (tx, ty + sub_h))
 
     sheet.save(out_jpg, quality=86)
+    page_paths = [out_jpg]
+    if len(clusters) > 16:
+        page_rows = 7
+        page_h = page_rows * block_h + 8
+        total_pages = (rows + page_rows - 1) // page_rows
+        base_no_ext = os.path.splitext(out_jpg)[0]
+        page_paths = []
+        for p_idx in range(total_pages):
+            y_start = p_idx * page_rows * block_h
+            y_end = min(sheet.height, y_start + page_h)
+            crop_img = sheet.crop((0, y_start, sheet.width, y_end))
+            p_path = f"{base_no_ext}_p{p_idx + 1}.jpg"
+            crop_img.save(p_path, quality=88)
+            page_paths.append(p_path)
+    return page_paths
 
 
 def main():
@@ -932,10 +947,13 @@ def main():
         )
 
     preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
+    preview_pages = [preview_jpg]
     try:
-        render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir)
+        preview_pages = render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir)
         print(f"\n[MANDATORY AI COLORIST STEP 1] Rendered Multi-Shot Scene Strip sheet: {preview_jpg}")
-        print("-> AI Colorist MUST call read_file on this sheet to inspect all 3 shots (First | Anchor | Outlier) per scene before grading!")
+        if len(preview_pages) > 1:
+            print(f"-> High-Res Paginated Scene Sheets ({len(preview_pages)} pages): {', '.join(preview_pages)}")
+        print("-> AI Colorist MUST call read_file on the Scene Strip sheets to inspect all 3 shots (First | Anchor | Outlier) per scene before grading!")
     except Exception as exc:
         print(f"Note: Could not render raw scene preview sheet ({exc})")
 
@@ -944,6 +962,7 @@ def main():
         "model_stats": model_stats,
         "ground_truth_source": gt_path,
         "raw_preview_sheet": preview_jpg,
+        "raw_preview_pages": preview_pages,
         "clip_bg_map": {str(k): v for k, v in clip_bg_map.items()},
         "bg_context": bg_context,
         "clusters": clusters,
