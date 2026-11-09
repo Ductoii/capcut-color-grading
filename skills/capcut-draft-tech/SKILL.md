@@ -19,12 +19,17 @@ All scripts and resources live inside this skill folder:
   - Discovers ground-truth scene maps (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `*PROMPT*.txt`, `sf-board.json`), scoring candidate tables by clip count and duration column (`30s` vs `10s`).
   - Merges reverse camera angles (`"góc"` $\rightarrow$ `BG<N>`) while keeping distinct sub-locations separate, and classifies each scene's initial lighting regime (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`, `is_flashback`).
   - Extracts 17-metric segment diagnostics at exact `source_timerange` in parallel (`ThreadPoolExecutor(max_workers=16)` with single-threaded `-threads 1` FFmpeg decoders at `216x122`), sampling **3 temporal points (`20% Entry`, `50% Center`, `80% Exit`)** per segment in a single FFmpeg pass to reject transient flashes/occlusions and record cut-boundary metrics (`entry_mid`, `exit_mid`, `entry_nrb`, `exit_nrb`, `intra_drift`), plus `neutral_rb` and `neutral_gm` (achromatic white-balance probe on lowest-30% chroma pixels) to separate true ambient lighting casts from colorful props/costumes/brick walls.
-  - Identifies each scene's `first_seg`, `anchor_seg`, and `outlier_seg` (`outlier_delta_mid`, `outlier_delta_rb`), caches scopes to `/tmp/capcut_metrics_<slug>.json` and decoded `uint8` frames to `/tmp/capcut_frames_<slug>.npy`, and renders the **3-Shot Scene Strip Contact Sheet** (`/tmp/<Project>_raw_scenes.jpg` + high-res paginated `_p1.jpg.._pN.jpg`) with zero redundant FFmpeg calls (`~24s` total for 315 segments x 3 frames = 945 frames).
+  - Identifies each scene's `first_seg`, `anchor_seg`, and `outlier_seg` (`outlier_delta_mid`, `outlier_delta_rb`), caches scopes to `/tmp/capcut_metrics_<slug>.json` (with backwards-compatible top-level aliases) and decoded `uint8` frames to `/tmp/capcut_frames_<slug>.npy`, renders the **3-Shot Scene Strip Contact Sheet** (`/tmp/<Project>_raw_scenes.jpg` + high-res paginated `_p1.jpg.._pN.jpg`), and automatically generates:
+    1. **`/tmp/<Project>_scene_report.txt`**: Complete human-readable Per-Segment Scope Report (`Seg #0..#N-1` with `Mid`, `P5`, `P95`, `RB`, `NRB`, `SkRB`, `Sat`, and `[OUTLIER]` flags) + Curated Clean Neutral 35mm LUT Palette table from `lut_optical_db.json` (eliminating any need for ad-hoc `python3` inspection commands).
+    2. **`/tmp/capcut_plan_<slug>.json`**: Pre-populated Starter AI Grading Plan JSON for all scenes with location-locked clean 35mm LUTs, `target_mid`, `preserve_warm_props`, and automatic biases so the AI Colorist can refine it via fast `edit_file` calls (`~200–500` tokens) instead of writing 250 lines of JSON from scratch.
 - [`scripts/apply_grade.py`](scripts/apply_grade.py):
   - Reuses `/tmp/capcut_metrics_<slug>.json` and `/tmp/capcut_frames_<slug>.npy` automatically and accepts the AI Colorist's bespoke **Scene & Shot Grading Plan (`--plan /tmp/capcut_plan_<slug>.json`)**.
   - Enforces regime-aware LUT tint guardrails (blocking heavy cyan/teal LUTs with `midRB < -0.055` or `midGM > +0.018` from warm/daylight scenes) and gates orange-cast cooling on `neutral_rb > 0.082`.
-  - Automatically handles **2-Space Intercutting (`A1 -> B1 -> A2 -> B2`)** both across recurring location clusters (`85%` `loc_anchor` lock for short intercuts `<= 3` segs) and inside a single bimodal Scene Cluster (`partition_intra_scene_subspaces` via optimal 1D 2-means split when both modes have `>= 2` segments), while pulling isolated 1-shot AI glitches (`count == 1`) back into the main space.
-  - Applies **Stage 1 (Scene-Locked LUT at `zorder: 2000` with `enable_skin_tone_correction: true` and micro-adaptive `±2.5%` intensity)** + **Stage 2 (Bounded Scene Baselines + Continuous Piecewise-Linear Two-Tier Shot Continuity using `65%` Sub-Space Anchor + `35%` Same-Space Boundary Neighbor & Multi-Cue Illumination/Skin Probe `d_nrb + d_skin_rb + d_shd_rb` + Closed-Loop Pixel-Level 3D LUT Feedback Trim `refine_grades_closed_loop_on_frames` at `zorder: 8004`)** to every child video segment (`video con`).
+  - Automatically handles **3-Axis Sub-Space Partitioning & Cross-Space Cutaway Isolation (`partition_intra_scene_subspaces`)**:
+    - Axis 1 (Exposure/Midtone bimodal split with `>= 2` segments per mode AND internal `std <= 0.048`),
+    - Axis 2 (Ambient color `neutral_rb` split with `>= 2` segments per mode AND internal `std <= 0.025`),
+    - Axis 3 (**Cross-Space Cutaway Isolation** for parallel/transition scenes with `↔`, `→`, `song song`, or multi-axis room jumps where `|dMid| > 0.145` and `|dContrast| > 0.10` or `|dNRB| > 0.032` from the main room, isolating 1-2 shot cutaways onto their own sub-space anchor while pulling ordinary 1-shot same-room AI glitches back into the main space).
+  - Applies **Stage 1 (Scene-Locked LUT at `zorder: 2000` with `enable_skin_tone_correction: true` and micro-adaptive `±2.5%` intensity)** + **Stage 2 (Bounded Scene Baselines + Optical LUT Midtone Shift Compensation `lut_mid_err` + Continuous Piecewise-Linear Two-Tier Shot Continuity using `65%` Sub-Space Anchor + `35%` Same-Space Boundary Neighbor & Multi-Cue Illumination/Skin Probe `d_nrb + d_skin_rb + d_shd_rb` + Closed-Loop Pixel-Level 3D LUT Feedback Trim `refine_grades_closed_loop_on_frames` at `zorder: 8004`)** to every child video segment (`video con`), preserving explicit AI per-segment `bright_offset` / `temp_offset` overrides.
   - Promotes active LUTs into `LutImportCfg.json[0:100]` (`index <= 99`) using parallel multi-threaded regex scanning across all local CapCut drafts so CapCut's Adjustment $\rightarrow$ LUT dropdown never displays `"None"`.
   - Synchronizes `draft_info.json`, `draft_info.json.bak`, `template-2.tmp`, `Timelines/*/attachment/patch/mini_draft.json` (`patch.json` reset), and `subdraft/*/draft_content.json`.
   - Renders both the **4-Tile Before/After Comparison Sheet** (`/tmp/<Project>_graded_comparison.jpg` + `_p1.jpg.._pN.jpg`: `1.Anc RAW | 2.Anc GRD | 3.Out RAW | 4.Out GRD` per scene) and the **Consecutive Shot-to-Shot Continuity Strip** (`/tmp/<Project>_shot_continuity.jpg`: up to 9 consecutive cuts `RAW` vs `GRADED` for the Opening Hook + top multi-shot scenes) in `~2.9s` total with 0 extra FFmpeg calls.
@@ -49,25 +54,28 @@ All scripts and resources live inside this skill folder:
 ## 3. End-to-End 5-Step CLI & Visual Workflow
 
 > **CRITICAL RULES (YAGNI & 10–20 MINUTE PROFESSIONAL DI BUDGET)**:
-> 1. **Time Budget (`10–20 Minutes`, Strictly `<= 20 Minutes`)**: Dedicate the 10–20 minute window to thorough visual inspection of all high-resolution paginated scene strips (`/tmp/<Project>_raw_scenes_p*.jpg`), screenplay context, bespoke `--plan` authoring, and multi-page visual QA (`/tmp/<Project>_graded_comparison_p*.jpg`).
-> 2. Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session, and avoid fragile `python3 -c` escaping one-liners.
-> 3. Rely on `apply_grade.py`'s built-in **Scene-Locked 1-LUT-Per-Scene + Achromatic `neutral_rb` Continuity Solver**, keying `scenes` in `/tmp/capcut_plan_<slug>.json` by `base_location` or `cluster_id` and `segments` only for genuine lighting/exposure outliers.
+> 1. **Time Budget (`10–20 Minutes`, Strictly `<= 20 Minutes`)**: Dedicate the 10–20 minute window to thorough visual inspection of all high-resolution paginated scene strips (`/tmp/<Project>_raw_scenes_p*.jpg`), `/tmp/<Project>_scene_report.txt`, screenplay context, targeted `edit_file` refinements on `/tmp/capcut_plan_<slug>.json`, and multi-page visual QA (`/tmp/<Project>_graded_comparison_p*.jpg` + `/tmp/<Project>_shot_continuity.jpg`).
+> 2. **ZERO-PYTHON-PROBING RULE**: Never edit or rewrite `analyze_project.py` or `apply_grade.py` during a project grading session, and **NEVER** run `python3 -c` or heredocs to inspect `/tmp/capcut_metrics_<slug>.json`, `lut_optical_db.json`, or `sf-board.json`. Read `/tmp/<Project>_scene_report.txt` and `/tmp/capcut_plan_<slug>.json` directly with `read_file`.
+> 3. **Use `edit_file` on `/tmp/capcut_plan_<slug>.json`**: Modify the pre-generated starter plan via `edit_file` rather than rewriting 250 lines of JSON from scratch with `write_file`.
 
 ```bash
-# Step 1: Analyze project, auto-detect model, map scenes, cache 17-metric scopes & render 3-shot strips
+# Step 1: Analyze project, auto-detect model, map scenes, cache 17-metric scopes,
+# render 3-shot strips (/tmp/<Project>_raw_scenes_p*.jpg), write /tmp/<Project>_scene_report.txt
+# and pre-generate /tmp/capcut_plan_<slug>.json
 python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" "<PROJECT_NAME_OR_ID>"
 
-# Step 2 & 3: Visually inspect /tmp/<Project>_raw_scenes.jpg with read_file + screenplay context,
-# then write /tmp/capcut_plan_<slug>.json with scene-level & shot-level grading direction.
+# Step 2 & 3: Call read_file in parallel on /tmp/<Project>_raw_scenes_p*.jpg,
+# /tmp/<Project>_scene_report.txt, and /tmp/capcut_plan_<slug>.json,
+# then use edit_file on /tmp/capcut_plan_<slug>.json to refine scene & outlier-shot grading direction.
 
-# Step 4: Apply 35mm grade with --plan, sync all CapCut draft mirrors & render 4-tile comparison sheet
+# Step 4: Apply 35mm grade with --plan, sync all CapCut draft mirrors & render 4-tile comparison + continuity sheets
 python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/apply_grade.py" "<PROJECT_NAME_OR_ID>" \
   --plan "/tmp/capcut_plan_<slug>.json" \
   --emotion narrative-arc \
   --auto-match-outliers \
   --relaunch
 
-# Step 5: Visually inspect /tmp/<Project>_graded_comparison.jpg with read_file and refine plan if needed.
+# Step 5: Visually inspect /tmp/<Project>_shot_continuity.jpg and /tmp/<Project>_graded_comparison_p*.jpg with read_file.
 ```
 
 ### Schema for `--plan /tmp/capcut_plan_<slug>.json`

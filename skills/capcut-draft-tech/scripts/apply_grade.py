@@ -824,10 +824,11 @@ def assign_unified_scene_targets(
         bg_code = c["bg_code"]
         regime = c.get("regime", "DAY_CRISP")
         base_loc = bg_code.split(":")[-1] if ":" in bg_code else bg_code
+        loc_family = re.sub(r"[A-Z]$", "", base_loc.upper())
         if bg_code.startswith("SEEDANCE_HOOK") or regime == "SEEDANCE_HOOK":
             gkey = ("SEEDANCE_HOOK", "SEEDANCE_HOOK")
         else:
-            gkey = (regime, base_loc)
+            gkey = (regime, loc_family)
         c["_group_key"] = gkey
         loc_groups[gkey].append(c)
 
@@ -920,60 +921,93 @@ def partition_intra_scene_subspaces(clusters: list, seg_records: list, default_m
     """
     Detects when a single Scene Cluster actually contains 2 distinct lighting sub-spaces jumping
     back and forth (`SubSpace-A` <-> `SubSpace-B`, e.g., dark alley vs. lit stall, shaded smoker vs.
-    sunny lane, or dark arena vs. bright judge spotlight table).
-    - Requires BOTH sub-spaces to have >= 2 segments (`len(A) >= 2` and `len(B) >= 2`), so a 1-shot
-      AI color/exposure glitch (`len == 1`) is NEVER mistaken for a second space and is instead pulled
-      tightly into the main space anchor.
-    - Requires a large physical separation (`|Mid_A - Mid_B| >= 0.115` or `|NeutRB_A - NeutRB_B| >= 0.058`)
-      and tight within-subspace cohesion (`within_var / total_var <= 0.42`).
+    sunny lane, dark arena vs. bright judge spotlight table, or Rosalee's bright kitchen <-> Terrell's dark attic).
+    1. Multi-Segment Bimodal Split (`len(A) >= 2` and `len(B) >= 2`):
+       - Requires BOTH sub-spaces to be internally cohesive (`std(vals_lo) <= 0.048` and `std(vals_hi) <= 0.048`
+         for exposure splits; `std(vals_c) <= 0.025` and `std(vals_w) <= 0.025` for color splits) so a 1-shot
+         cutaway in another room is never lumped with a shot from the main room.
+    2. Cross-Space Cutaway Isolation (for parallel/transition scenes `"↔"`, `"→"`, `"song song"`, `"intercut"`,
+       or when 1 segment has an extreme multi-axis room jump `|dMid| >= 0.155` AND `|dP5| >= 0.075` while the
+       remaining `N-1` segments are cohesive `std <= 0.052`):
+       - Isolates the cutaway shot into its own sub-space while keeping all `N-1` main-room shots 100% unified.
     """
     split_count = 0
     for c in clusters:
         s_indices = c.get("seg_indices", [])
         c["subspace_by_seg"] = {}
-        if len(s_indices) < 4:
+        if len(s_indices) < 2:
             continue
         ms = [seg_records[i].get("metrics") or default_m for i in s_indices]
         mids = np.array([float(m.get("mid", 0.30)) for m in ms])
+        p5s = np.array([float(m.get("p5", 0.05)) for m in ms])
         nrbs = np.array([float(m.get("neutral_rb", m.get("rb", 0.12) * 0.45)) for m in ms])
+        sc_t = (c.get("scene_title") or "").lower()
+        is_explicit_dual_loc = any(k in sc_t for k in ("↔", "→", "song song", "intercut", "parallel", "hai nơi"))
 
         best_split = None
-        # Check Axis 1: Exposure / Lighting Zone bimodality (`mid`) using optimal 1D 2-means split (requiring >= 2 segs per mode)
-        order_m = np.argsort(mids)
-        tot_var_m = float(np.var(mids)) + 1e-6
-        best_ratio_m = 1.0
-        for split_k in range(2, len(s_indices) - 1):
-            lo_pos, hi_pos = order_m[:split_k], order_m[split_k:]
-            vals_lo, vals_hi = mids[lo_pos], mids[hi_pos]
-            gap_mid = float(np.median(vals_hi)) - float(np.median(vals_lo))
-            if gap_mid < 0.125:
-                continue
-            w_var = (len(vals_lo) * float(np.var(vals_lo)) + len(vals_hi) * float(np.var(vals_hi))) / len(mids)
-            ratio = w_var / tot_var_m
-            if ratio <= 0.36 and ratio < best_ratio_m:
-                best_ratio_m = ratio
-                grp_lo = [s_indices[p] for p in lo_pos]
-                grp_hi = [s_indices[p] for p in hi_pos]
-                best_split = (grp_lo, grp_hi, f"2-Space Exposure Split (dMid={gap_mid:.2f})")
-
-        # Check Axis 2: Ambient Color Temperature bimodality (`neutral_rb`) if not already split
-        if best_split is None:
-            order_n = np.argsort(nrbs)
-            tot_var_n = float(np.var(nrbs)) + 1e-6
-            best_ratio_n = 1.0
+        if len(s_indices) >= 4:
+            # Check Axis 1: Exposure / Lighting Zone bimodality (`mid`) requiring internal cohesion in both modes
+            order_m = np.argsort(mids)
+            tot_var_m = float(np.var(mids)) + 1e-6
+            best_ratio_m = 1.0
             for split_k in range(2, len(s_indices) - 1):
-                lo_pos, hi_pos = order_n[:split_k], order_n[split_k:]
-                vals_c, vals_w = nrbs[lo_pos], nrbs[hi_pos]
-                gap_nrb = float(np.median(vals_w)) - float(np.median(vals_c))
-                if gap_nrb < 0.062:
+                lo_pos, hi_pos = order_m[:split_k], order_m[split_k:]
+                vals_lo, vals_hi = mids[lo_pos], mids[hi_pos]
+                if float(np.std(vals_lo)) > 0.048 or float(np.std(vals_hi)) > 0.048:
                     continue
-                w_var = (len(vals_c) * float(np.var(vals_c)) + len(vals_w) * float(np.var(vals_w))) / len(nrbs)
-                ratio = w_var / tot_var_n
-                if ratio <= 0.36 and ratio < best_ratio_n:
-                    best_ratio_n = ratio
-                    grp_cool = [s_indices[p] for p in lo_pos]
-                    grp_warm = [s_indices[p] for p in hi_pos]
-                    best_split = (grp_cool, grp_warm, f"2-Space Color Split (dNRB={gap_nrb:.2f})")
+                gap_mid = float(np.median(vals_hi)) - float(np.median(vals_lo))
+                if gap_mid < 0.125:
+                    continue
+                w_var = (len(vals_lo) * float(np.var(vals_lo)) + len(vals_hi) * float(np.var(vals_hi))) / len(mids)
+                ratio = w_var / tot_var_m
+                if ratio <= 0.36 and ratio < best_ratio_m:
+                    best_ratio_m = ratio
+                    grp_lo = [s_indices[p] for p in lo_pos]
+                    grp_hi = [s_indices[p] for p in hi_pos]
+                    best_split = (grp_lo, grp_hi, f"2-Space Exposure Split (dMid={gap_mid:.2f})")
+
+            # Check Axis 2: Ambient Color Temperature bimodality (`neutral_rb`) if not already split
+            if best_split is None:
+                order_n = np.argsort(nrbs)
+                tot_var_n = float(np.var(nrbs)) + 1e-6
+                best_ratio_n = 1.0
+                for split_k in range(2, len(s_indices) - 1):
+                    lo_pos, hi_pos = order_n[:split_k], order_n[split_k:]
+                    vals_c, vals_w = nrbs[lo_pos], nrbs[hi_pos]
+                    if float(np.std(vals_c)) > 0.025 or float(np.std(vals_w)) > 0.025:
+                        continue
+                    gap_nrb = float(np.median(vals_w)) - float(np.median(vals_c))
+                    if gap_nrb < 0.062:
+                        continue
+                    w_var = (len(vals_c) * float(np.var(vals_c)) + len(vals_w) * float(np.var(vals_w))) / len(nrbs)
+                    ratio = w_var / tot_var_n
+                    if ratio <= 0.36 and ratio < best_ratio_n:
+                        best_ratio_n = ratio
+                        grp_cool = [s_indices[p] for p in lo_pos]
+                        grp_warm = [s_indices[p] for p in hi_pos]
+                        best_split = (grp_cool, grp_warm, f"2-Space Color Split (dNRB={gap_nrb:.2f})")
+
+        # Check Axis 3: Cross-Space Cutaway Isolation (e.g. parallel kitchen <-> attic or exterior -> interior transition)
+        if best_split is None:
+            if len(s_indices) == 2 and is_explicit_dual_loc and (abs(mids[1] - mids[0]) >= 0.120 or abs(nrbs[1] - nrbs[0]) >= 0.055):
+                best_split = ([s_indices[0]], [s_indices[1]], f"2-Space Transition Split (dNRB={ abs(nrbs[1]-nrbs[0]):.2f})")
+            elif len(s_indices) >= 3:
+                for k_pos in range(len(s_indices)):
+                    other_pos = [p for p in range(len(s_indices)) if p != k_pos]
+                    other_mids = mids[other_pos]
+                    if float(np.std(other_mids)) > 0.052:
+                        continue
+                    med_m = float(np.median(other_mids))
+                    med_p5 = float(np.median(p5s[other_pos]))
+                    med_nrb = float(np.median(nrbs[other_pos]))
+                    dm = abs(float(mids[k_pos]) - med_m)
+                    dp5 = abs(float(p5s[k_pos]) - med_p5)
+                    dnrb = abs(float(nrbs[k_pos]) - med_nrb)
+                    if (dm >= 0.155 and dp5 >= 0.075 and dnrb >= 0.030) or (is_explicit_dual_loc and (dm >= 0.135 or dnrb >= 0.055)):
+                        grp_main = [s_indices[p] for p in other_pos]
+                        grp_cut = [s_indices[k_pos]]
+                        best_split = (grp_main, grp_cut, f"2-Space Cutaway Split (dMid={dm:.2f})")
+                        break
 
         if best_split is not None:
             grp_a, grp_b, reason = best_split
@@ -987,6 +1021,10 @@ def partition_intra_scene_subspaces(clusters: list, seg_records: list, default_m
                     sub_anc[k] = round(0.80 * med_v + 0.20 * float(base_anc[k]), 4)
                 for s_idx in grp:
                     c["subspace_by_seg"][s_idx] = (sub_anc, grp, f"{lbl}:{reason}")
+            # Update `unified_anchor` of the cluster to the majority sub-space so scene header summary reflects the main space
+            maj_grp = grp_a if len(grp_a) >= len(grp_b) else grp_b
+            if maj_grp and maj_grp[0] in c["subspace_by_seg"]:
+                c["unified_anchor"] = dict(c["subspace_by_seg"][maj_grp[0]][0])
             c["has_subspaces"] = reason
             split_count += 1
     return split_count
@@ -1043,6 +1081,8 @@ def compute_shot_lut_and_adjustments(
     mid = m.get("mid", 0.28)
     p95 = m.get("p95", 0.62)
     p99 = m.get("p99", 0.76)
+    if p95 < 0.04 and mid < 0.02:
+        return scene_cfg.get("lut", "SKINTONE (10).cube"), 0.0, [], "[Black-Outro Bypass]"
     c = m.get("contrast", 0.55)
     rb = m.get("rb", 0.13)
     shd_rb = m.get("shd_rb", rb * 0.5)
@@ -1159,15 +1199,20 @@ def compute_shot_lut_and_adjustments(
             b_shd = +0.02 if anc_mid < 0.34 else -0.01
         b_hl = -0.03 if eff_model == "grok" else -0.02
 
-    # Allow explicit target_mid override from AI scene plan to shift b_br/b_shd gently
+    # Allow explicit target_mid override from AI scene plan + compensate for optical LUT midtone shift (`sim_mid`)
     target_mid = scene_cfg.get("target_mid", anc_mid)
-    plan_mid_delta = clamp(target_mid - anc_mid, -0.06, 0.06)
-    if abs(plan_mid_delta) > 0.020 and 0.290 <= anc_mid <= 0.440:
-        b_br = clamp(b_br + plan_mid_delta * 0.45, -0.05, 0.06)
+    sim_mid = float(scene_cfg.get("sim_anchor", {}).get("sim_mid", anc_mid))
+    lut_mid_err = sim_mid - target_mid
+    if abs(lut_mid_err) > 0.012 and 0.250 <= anc_mid <= 0.440:
+        b_br = clamp(b_br - lut_mid_err * 0.55, -0.05, 0.06)
+    else:
+        plan_mid_delta = clamp(target_mid - anc_mid, -0.06, 0.06)
+        if abs(plan_mid_delta) > 0.020 and 0.290 <= anc_mid <= 0.440:
+            b_br = clamp(b_br + plan_mid_delta * 0.45, -0.05, 0.06)
 
-    if not preserve_warm and anc_nrb > 0.082:
+    if not preserve_warm and anc_nrb > 0.075:
         # True heavy amber/tungsten ambient cast on neutral pixels -> cool cleanly
-        b_tp = clamp(-(anc_nrb - 0.055) * 0.45, -0.05, -0.02)
+        b_tp = clamp(-(anc_nrb - 0.042) * 0.62, -0.06, -0.025)
     elif anc_nrb < -0.010 or (regime == "DAY_CRISP" and anc_rb < 0.035):
         # Cold cyan cast -> warm gently
         b_tp = +0.02
@@ -1393,6 +1438,7 @@ def refine_grades_closed_loop_on_frames(
     clusters: list,
     frames_arr: np.ndarray,
     lut_map: dict,
+    plan_segs: dict = None,
 ) -> dict:
     """
     Closed-Loop Pixel-Level 3D LUT + Adjust Verification & Feedback Trim:
@@ -1400,11 +1446,13 @@ def refine_grades_closed_loop_on_frames(
        on every segment's decoded RGB frame (`frames_arr`).
     2. Measures the true post-grade pixel Luma (`g_mid`) and Achromatic White Balance (`g_nrb`) for every shot.
     3. Applies a closed-loop residual feedback trim to `brightness`, `shadow`, `highlight`, and `temperature`
-       whenever a shot's post-LUT output still deviates from its Sub-Space Anchor + Immediate Same-Space Neighbor.
+       whenever a shot's post-LUT output still deviates from its Sub-Space Anchor + Immediate Same-Space Neighbor
+       (while preserving any explicit per-segment offsets supplied by the AI Colorist in `plan_segs`).
     4. Returns quantitative before/after cut-to-cut continuity statistics across the entire timeline.
     """
     if frames_arr is None or len(frames_arr) == 0:
         return {"closed_loop_trims": 0, "raw_cut_dmid": 0.0, "grd_cut_dmid": 0.0, "raw_cut_dnrb": 0.0, "grd_cut_dnrb": 0.0}
+    plan_segs = plan_segs or {}
 
     used_luts = {lut_map.get(seg_applied[s][0], "") for s in seg_applied if lut_map.get(seg_applied[s][0], "")}
     if used_luts:
@@ -1433,6 +1481,8 @@ def refine_grades_closed_loop_on_frames(
         sub_map = c.get("subspace_by_seg", {})
         groups = defaultdict(list)
         for s_idx in s_indices:
+            if s_idx in seg_applied and seg_applied[s_idx][1] <= 0.0 and not seg_applied[s_idx][2]:
+                continue
             if s_idx in sub_map:
                 groups[sub_map[s_idx][2]].append(s_idx)
             else:
@@ -1456,10 +1506,14 @@ def refine_grades_closed_loop_on_frames(
                 res_mid = g_m - ref_g_mid
                 res_nrb = g_nrb - ref_g_nrb
 
-                if abs(res_mid) > 0.014 or abs(res_nrb) > 0.010:
+                scfg_s = plan_segs.get(str(s_idx)) or plan_segs.get(f"#{s_idx}") or {}
+                has_explicit_exp = any(k in scfg_s for k in ("bright_offset", "shadow_offset", "highlight_offset", "adjust"))
+                has_explicit_tmp = any(k in scfg_s for k in ("temp_offset", "adjust"))
+
+                if (abs(res_mid) > 0.014 and not has_explicit_exp) or (abs(res_nrb) > 0.010 and not has_explicit_tmp):
                     lut_title, lut_val, adj_list, prof = seg_applied[s_idx]
                     adict = dict(adj_list)
-                    if abs(res_mid) > 0.014:
+                    if abs(res_mid) > 0.014 and not has_explicit_exp:
                         adict["brightness"] = non_zero_clamp(
                             adict.get("brightness", 0.0) - res_mid * 0.42, -0.10, 0.12, min_abs=0.01, default_sign=-1.0
                         )
@@ -1469,7 +1523,7 @@ def refine_grades_closed_loop_on_frames(
                         adict["highlight"] = non_zero_clamp(
                             adict.get("highlight", 0.0) - res_mid * 0.20, -0.11, 0.06, min_abs=0.01, default_sign=-1.0
                         )
-                    if abs(res_nrb) > 0.010:
+                    if abs(res_nrb) > 0.010 and not has_explicit_tmp:
                         adict["temperature"] = non_zero_clamp(
                             adict.get("temperature", 0.0) - res_nrb * 0.45, -0.09, 0.08, min_abs=0.01, default_sign=-1.0
                         )
@@ -2062,7 +2116,10 @@ def main():
             seg_to_cluster[s_idx] = c
 
     explicit_match = {x.strip() for x in args.match_clips.split(",") if x.strip()}
-    plan_segs = custom_plan.get("segments", {}) or {}
+    plan_segs = {
+        **(custom_plan.get("segment_overrides", {}) or {}),
+        **(custom_plan.get("segments", {}) or {}),
+    }
 
     summary = []
     seg_applied = {}
@@ -2145,7 +2202,7 @@ def main():
         except Exception:
             frames_arr = None
 
-    cl_stats = refine_grades_closed_loop_on_frames(seg_applied, clusters, frames_arr, lut_map)
+    cl_stats = refine_grades_closed_loop_on_frames(seg_applied, clusters, frames_arr, lut_map, plan_segs=plan_segs)
 
     for idx, (d_obj, seg, _, _) in enumerate(all_seg_tuples):
         effects = d_obj["materials"].setdefault("effects", [])

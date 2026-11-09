@@ -160,9 +160,12 @@ def _measure_single_frame(arr: np.ndarray) -> dict:
     rb_map = r - b
     gm_map = g - 0.5 * (r + b)
     rb = float(np.mean(rb_map))
-    shd_rb = float(np.mean(rb_map[luma <= p25]))
-    mid_rb = float(np.mean(rb_map[(luma > p25) & (luma < p75)]))
-    hi_rb = float(np.mean(rb_map[luma >= p75]))
+    shd_mask = luma <= p25
+    mid_mask = (luma > p25) & (luma < p75)
+    hi_mask = luma >= p75
+    shd_rb = float(np.mean(rb_map[shd_mask])) if np.any(shd_mask) else rb
+    mid_rb = float(np.mean(rb_map[mid_mask])) if np.any(mid_mask) else rb
+    hi_rb = float(np.mean(rb_map[hi_mask])) if np.any(hi_mask) else rb
     gm = float(np.mean(gm_map))
     cmax = np.max(arr, axis=2)
     cmin = np.min(arr, axis=2)
@@ -261,12 +264,19 @@ def extract_segment_metrics(video_path: str, start_sec: float = 0.0, dur_sec: fl
 
     n_frames = len(raw) // f_bytes
     u8_stack = np.frombuffer(raw[:n_frames * f_bytes], dtype=np.uint8).reshape((n_frames, H, W, 3)).copy()
-    u8_frame = u8_stack[n_frames // 2]
 
     per_frame_ms = [_measure_single_frame(u8_stack[i].astype(np.float32) / 255.0) for i in range(n_frames)]
     res_m = {}
     for k in per_frame_ms[0].keys():
         res_m[k] = round(float(np.median([fm[k] for fm in per_frame_ms])), 4)
+
+    # Pick the frame in u8_stack that best matches the temporal median metrics (avoids transient 50% cutaways/blinks)
+    best_f_idx = min(
+        range(n_frames),
+        key=lambda i: abs(per_frame_ms[i]["mid"] - res_m["mid"]) * 1.5
+        + abs(per_frame_ms[i]["neutral_rb"] - res_m["neutral_rb"]) * 2.0,
+    )
+    u8_frame = u8_stack[best_f_idx]
 
     res_m["entry_mid"] = round(float(per_frame_ms[0]["mid"]), 4)
     res_m["exit_mid"] = round(float(per_frame_ms[-1]["mid"]), 4)
@@ -305,19 +315,32 @@ def extract_clip_key(mname: str):
     return extract_clip_number(mname)
 
 
-def classify_script_regime(text: str, bg_code: str = "") -> tuple[str, bool]:
+def classify_script_regime(
+    text: str,
+    bg_code: str = "",
+    scene_title: str = "",
+    bg_label: str = "",
+) -> tuple[str, bool]:
     """
     Infers the lighting/scene regime and flashback flag from ground-truth script descriptions
-    (location code suffixes, scene headers, BG descriptions, and clip prompts).
-    Prioritizes explicit time-of-day / location suffixes on `bg_code` (e.g. `LANE_DAY`, `ICEDOCK_DAY`,
-    `ENTRY_EVENING`, `BACKROOM_DAY`, `ROW_FINAL_NIGHT`) so single-shot prompt words never misclassify a location.
+    (location code suffixes, scene headers, BG labels, BG descriptions, and clip prompts).
+    1. Prioritizes explicit time-of-day / location suffixes on `bg_code`.
+    2. Prioritizes authoritative `scene_title` + `bg_label` over incidental dialogue words in `shot_prompt`.
+    3. Never uses generic Vietnamese words like `"nhà"` (which appear in `"sân trước nhà"`, `"toà nhà"`,
+       `"phòng nhà đất"`, `"nhà chờ xe buýt"`) as an indoor trigger before checking outdoor/daytime keywords.
     """
     t = (text or "").lower()
+    hdr = f"{scene_title or ''} | {bg_label or ''}".lower().strip()
+    if not hdr or hdr == "|":
+        hdr = t[:160]
     bg_up = (bg_code or "").upper()
     base_loc = bg_up.split(":")[-1] if ":" in bg_up else bg_up
-    is_flashback = any(k in t for k in ("mười năm trước", "10 năm trước", "years ago", "sinh nhật 15", "quá khứ", "flashback", "hồi tưởng"))
+    is_flashback = any(
+        k in t
+        for k in ("mười năm trước", "10 năm trước", "years ago", "sinh nhật 15", "quá khứ", "flashback", "hồi tưởng")
+    )
 
-    # 1. Explicit time-of-day / location tokens in `base_loc` (e.g. sf-board.json location IDs)
+    # 1. Explicit time-of-day / location tokens in `base_loc` (e.g. `LANE_DAY`, `ICEDOCK_DAY`, `ROW_FINAL_NIGHT`)
     if any(k in base_loc for k in ("_DAWN", "_DUSK", "_SUNSET", "_EVENING", "_GOLD", "DAWN", "DUSK", "EVENING", "SUNSET")):
         return "DAWN_DUSK_GOLD", is_flashback
     if any(k in base_loc for k in ("_NIGHT", "_MIDNIGHT", "NIGHT", "MIDNIGHT")):
@@ -329,23 +352,69 @@ def classify_script_regime(text: str, bg_code: str = "") -> tuple[str, bool]:
     if any(k in base_loc for k in ("_DAY", "_NOON", "_MORNING", "NOON", "MORNING")):
         if any(k in base_loc for k in ("SERVER", "CLINIC", "HOSPITAL", "MORGUE", "LAB", "ICEROOM")):
             return "COOL_TECH", is_flashback
-        if any(k in base_loc for k in ("BACKROOM", "KITCHEN", "DINING", "LIVING", "HALL", "FOYER", "LOBBY", "PARLOR", "SALON", "APARTMENT", "HOME", "HOUSE")):
+        if any(k in base_loc for k in ("BACKROOM", "KITCHEN", "DINING", "LIVING", "HALL", "FOYER", "LOBBY", "PARLOR", "SALON", "APARTMENT")):
             return "WARM_INT", is_flashback
         return "DAY_CRISP", is_flashback
 
-    # 2. Script header / BG description keywords
+    # 2. Authoritative Scene Title + BG Label (`hdr`) & Full Description (`t`) checks
     if any(k in t for k in ("bão tuyết", "mưa đêm", "đêm mưa", "blizzard", "storm", "rainy night", "/coldtone:", "ngoài trời đêm", "3 giờ sáng", "3:00 am")):
         return "NIGHT_COOL", is_flashback
     if any(k in t for k in ("server", "máy chủ", "hành lang kỹ thuật", "phòng khám", "clinic", "hospital", "bệnh viện", "kho lạnh", "iceroom", "phòng thay đồ", "locker")):
         return "COOL_TECH", is_flashback
-    if any(k in t for k in ("bình minh", "hoàng hôn", "chiều tà", "nắng chiều", "dawn", "sunrise", "sunset", "dusk", "golden hour", "gold", "5:45 pm", "6 giờ chiều", "chiều tối")):
-        return "DAWN_DUSK_GOLD", is_flashback
-    if any(k in t for k in ("đêm", "tối", "khuya", "nửa đêm", "night", "evening", "midnight", "/amberlook:", "tiệc tối", "8 giờ tối", "9 giờ tối")):
+
+    has_day_in_hdr = any(k in hdr for k in ("sáng", "trưa", "ban ngày", "8:", "9:", "10:", "11:", "12:", "morning", "noon"))
+    has_night_in_hdr = any(k in hdr for k in ("đêm", "tối", "khuya", "nửa đêm", "night", "midnight", "8 giờ tối", "9 giờ tối"))
+
+    if has_night_in_hdr and not has_day_in_hdr:
+        if any(k in t for k in ("moonlit", "ánh trăng", "mưa đêm", "blizzard", "/coldtone:")):
+            return "NIGHT_COOL", is_flashback
         return "NIGHT_WARM", is_flashback
-    if any(k in t for k in ("bếp", "kitchen", "căn hộ", "apartment", "vườn", "garden", "công viên", "park", "thư phòng", "phòng ăn", "dining", "sảnh", "lobby", "foyer", "salon", "nhà", "backroom")):
-        return "WARM_INT", is_flashback
-    if any(k in t for k in ("văn phòng", "office", "phòng họp", "meeting", "boardroom", "điều trần", "hearing", "sân đỗ", "nhà chứa", "hangar", "tarmac", "ban ngày", "sáng", "trưa")):
+
+    # Golden Hour / Sunset / Dusk / Dawn check
+    if any(k in hdr for k in ("hoàng hôn", "chiều tà", "nắng chiều", "golden hour", "sunset", "dusk", "bình minh", "sunrise")):
+        return "DAWN_DUSK_GOLD", is_flashback
+    if any(k in hdr for k in ("rạng sáng", "rạng đông", "dawn")):
+        if "cold gray dawn" in t or "gray dawn" in t:
+            return "DAY_CRISP", is_flashback
+        return "DAWN_DUSK_GOLD", is_flashback
+    if "chiều" in hdr and any(k in hdr for k in ("hiên", "sân", "ngoài", "vườn", "công viên", "bến", "đường", "phố", "porch", "yard")):
+        return "DAWN_DUSK_GOLD", is_flashback
+    if not has_day_in_hdr and any(k in t for k in ("warm golden afternoon", "golden hour", "hoàng hôn", "chiều tà", "nắng chiều", "sunset", "dusk")):
+        return "DAWN_DUSK_GOLD", is_flashback
+
+    # Explicit Outdoor / Street / Yard / Boardroom / Site Container in Scene Header -> DAY_CRISP
+    outdoor_or_crisp_hdr = (
+        "sân trước", "sân sau", "bậc thềm trước", "lề đường", "vỉa hè", "ngoài trời",
+        "trạm xe buýt", "nhà chờ xe buýt", "lễ động thổ", "công trường", "container văn phòng",
+        "phòng họp", "boardroom", "sân đỗ", "nhà chứa", "hangar", "tarmac",
+        "công viên", "bãi biển", "bến cảng", "con phố", "phố ",
+        "front yard", "backyard", "street", "sidewalk", "curb", "bus stop", "exterior", "outdoor",
+    )
+    if any(k in hdr for k in outdoor_or_crisp_hdr):
         return "DAY_CRISP", is_flashback
+
+    if not has_day_in_hdr and any(k in t for k in ("đêm", "tối", "khuya", "nửa đêm", "night", "evening", "midnight", "/amberlook:", "tiệc tối", "8 giờ tối", "9 giờ tối")):
+        return "NIGHT_WARM", is_flashback
+
+    # Warm Interior Rooms (without generic "nhà")
+    warm_int_keywords = (
+        "bếp", "kitchen", "gác mái", "attic", "căn hộ", "apartment",
+        "phòng khách", "living room", "phòng ăn", "dining", "thư phòng", "study",
+        "bàn thanh tra", "phòng nhà đất", "sảnh", "lobby", "foyer", "salon", "backroom",
+        "nhà thờ", "chapel",
+    )
+    if any(k in hdr for k in warm_int_keywords) or (not has_day_in_hdr and any(k in t for k in warm_int_keywords)):
+        return "WARM_INT", is_flashback
+
+    if has_day_in_hdr or any(k in t for k in ("văn phòng", "office", "phòng họp", "meeting", "boardroom", "điều trần", "hearing", "sân đỗ", "nhà chứa", "hangar", "tarmac", "ban ngày", "sáng", "trưa", "morning", "noon", "daylight")):
+        return "DAY_CRISP", is_flashback
+
+    if any(k in hdr for k in ("chiều", "afternoon")):
+        return "WARM_INT", is_flashback
+
+    if any(k in t for k in warm_int_keywords):
+        return "WARM_INT", is_flashback
+
     return "AUTO", is_flashback
 
 
@@ -381,19 +450,30 @@ def discover_ground_truth_scene_map(
                 clip_map = {}
                 bg_context = {}
                 distinct_variants = set()
+                angle_variants = set()
+                has_multi_variants = set()
                 sf_lookup = {}
                 bg_desc_by_id = {}
+                bg_label_by_id = {}
                 for sc in data.get("scenes", []):
                     for sf in sc.get("sfs", []):
                         rid = sf.get("id", "")
                         if rid:
                             sf_lookup[rid] = sf
-                        rdesc = " ".join(str(sf.get(k) or "") for k in ("name", "title", "desc", "prompt")).strip()
+                        rlabel = str(sf.get("label") or sf.get("name") or sf.get("title") or "").strip()
+                        rdesc = " ".join(str(sf.get(k) or "") for k in ("label", "name", "title", "desc", "prompt")).strip()
                         if rid:
-                            bg_desc_by_id[rid.upper()] = rdesc
-                        if re.match(r"^(BG|IMG)\d+[b-z]$", rid, re.IGNORECASE):
-                            rlow = rdesc.lower()
-                            if any(kw in rlow for kw in ("đêm", "tối", "night", "evening", "dusk", "veranda", "ngoài", "hiên", "phòng cúp")):
+                            rid_up = rid.upper()
+                            bg_desc_by_id[rid_up] = rdesc
+                            bg_label_by_id[rid_up] = rlabel
+                        m_var = re.match(r"^((?:BG|IMG)\d+)([a-z])$", rid, re.IGNORECASE)
+                        if m_var:
+                            base_v, suf_v = m_var.group(1).upper(), m_var.group(2).upper()
+                            if suf_v != "A":
+                                has_multi_variants.add(base_v)
+                            if "góc" in rlabel.lower() or "angle" in rlabel.lower():
+                                angle_variants.add(rid.upper())
+                            else:
                                 distinct_variants.add(rid.upper())
 
                 def _resolve_sfb_bg(raw_ref: str, sc_id: str) -> str:
@@ -405,9 +485,12 @@ def discover_ground_truth_scene_map(
                         if c_up.startswith(("REF_BG_", "BG", "IMG")):
                             if c_up.startswith("REF_BG_"):
                                 return c_up.replace("REF_BG_", "")
-                            if c_up in distinct_variants:
+                            base_only = re.sub(r"[A-Z]$", "", c_up)
+                            if c_up in angle_variants:
+                                return base_only
+                            if base_only in has_multi_variants and c_up in distinct_variants:
                                 return c_up
-                            return re.sub(r"[A-Z]$", "", c_up)
+                            return base_only
                         node = sf_lookup.get(cur)
                         if not node:
                             break
@@ -432,13 +515,16 @@ def discover_ground_truth_scene_map(
                         clip_map[ckey] = bg_tag
                         clip_map[str(ckey)] = bg_tag
                         shot_prompt = sf.get("prompt") or sf.get("desc") or sf.get("text") or ""
-                        bg_desc = bg_desc_by_id.get(str(raw_bg).upper(), "") or bg_desc_by_id.get(base_bg, "")
+                        raw_bg_up = str(raw_bg).upper()
+                        bg_desc = bg_desc_by_id.get(raw_bg_up, "") or bg_desc_by_id.get(base_bg, "")
+                        bg_label = bg_label_by_id.get(raw_bg_up, "") or bg_label_by_id.get(base_bg, "")
                         combined_desc = f"{sc_title} | {bg_desc} | {shot_prompt[:180]}"
-                        regime, is_fb = classify_script_regime(combined_desc, bg_tag)
+                        regime, is_fb = classify_script_regime(combined_desc, bg_tag, scene_title=sc_title, bg_label=bg_label)
                         if bg_tag not in bg_context or bg_context[bg_tag].get("regime") == "AUTO":
                             bg_context[bg_tag] = {
                                 "scene_title": sc_title,
-                                "bg_desc": bg_desc[:140],
+                                "bg_label": bg_label,
+                                "bg_desc": bg_desc[:180],
                                 "regime": regime,
                                 "is_flashback": is_fb,
                             }
@@ -560,12 +646,15 @@ def discover_ground_truth_scene_map(
                         bg_norm = _norm_bg(base_b, suf_b)
                         bg_tag = f"{era_label}:{bg_norm}"
                         clip_map[cnum] = bg_tag
-                        raw_desc = f"{current_hdr_text} | {ref_bg_descs.get(f'{base_b}{suf_b}', ref_bg_descs.get(base_b, ''))} | {tail_str[:120]}"
-                        regime, is_fb = classify_script_regime(raw_desc, bg_tag)
+                        bg_desc_val = ref_bg_descs.get(f"{base_b}{suf_b}", ref_bg_descs.get(base_b, ""))
+                        raw_desc = f"{current_hdr_text} | {bg_desc_val} | {tail_str[:120]}"
+                        regime, is_fb = classify_script_regime(
+                            raw_desc, bg_tag, scene_title=current_hdr_text, bg_label=bg_desc_val[:80]
+                        )
                         if bg_tag not in bg_context or bg_context[bg_tag].get("regime") == "AUTO":
                             bg_context[bg_tag] = {
                                 "scene_title": current_hdr_text or tail_str[:60],
-                                "bg_desc": ref_bg_descs.get(f"{base_b}{suf_b}", ref_bg_descs.get(base_b, "")),
+                                "bg_desc": bg_desc_val,
                                 "regime": regime,
                                 "is_flashback": is_fb,
                             }
@@ -587,12 +676,15 @@ def discover_ground_truth_scene_map(
                         bg_norm = _norm_bg(base_b, suf_b)
                         bg_tag = f"{era_label}:{bg_norm}"
                         clip_map[cnum] = bg_tag
-                        raw_desc = f"{current_hdr_text} | {ref_bg_descs.get(f'{base_b}{suf_b}', '')} | {body[:160]}"
-                        regime, is_fb = classify_script_regime(raw_desc, bg_tag)
+                        bg_desc_val = ref_bg_descs.get(f"{base_b}{suf_b}", "")
+                        raw_desc = f"{current_hdr_text} | {bg_desc_val} | {body[:160]}"
+                        regime, is_fb = classify_script_regime(
+                            raw_desc, bg_tag, scene_title=current_hdr_text, bg_label=bg_desc_val[:80]
+                        )
                         if bg_tag not in bg_context or bg_context[bg_tag].get("regime") == "AUTO":
                             bg_context[bg_tag] = {
                                 "scene_title": current_hdr_text,
-                                "bg_desc": ref_bg_descs.get(f"{base_b}{suf_b}", ""),
+                                "bg_desc": bg_desc_val,
                                 "regime": regime,
                                 "is_flashback": is_fb,
                             }
@@ -696,7 +788,9 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
     clusters = []
     for b_idx in range(len(boundaries) - 1):
         s_idx, e_idx = boundaries[b_idx], boundaries[b_idx + 1]
-        c_ms = ms[s_idx:e_idx]
+        seg_range = list(range(s_idx, e_idx))
+        valid_seg_range = [j for j in seg_range if ms[j].get("p95", 1.0) >= 0.04] or seg_range
+        c_ms = [ms[j] for j in valid_seg_range]
         anchor = {k: round(float(np.median([x[k] for x in c_ms])), 4) for k in default_m}
         bg_code = raw_bgs[s_idx]
         ctx = bg_context.get(bg_code, {})
@@ -719,16 +813,18 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
                 regime = "COOL_TECH" if anchor["mid"] <= 0.28 else "DAY_CRISP"
             else:
                 regime = "WARM_INT" if anchor["rb"] >= 0.125 else "DAY_CRISP"
+        elif regime == "DAWN_DUSK_GOLD" and anchor["rb"] < 0.068 and anchor.get("neutral_rb", 0.0) < 0.022:
+            # Empirically cool/neutral early morning light (e.g. "rạng sáng" / cold gray dawn) -> DAY_CRISP
+            regime = "DAY_CRISP"
 
-        seg_range = list(range(s_idx, e_idx))
         anchor_seg = min(
-            seg_range,
+            valid_seg_range,
             key=lambda j: abs(ms[j]["mid"] - anchor["mid"]) * 1.5
             + abs(ms[j].get("neutral_rb", 0.0) - anchor.get("neutral_rb", 0.0)) * 2.0
             + abs(ms[j]["rb"] - anchor["rb"]) * 0.5,
         )
         outlier_seg = max(
-            seg_range,
+            valid_seg_range,
             key=lambda j: abs(ms[j]["mid"] - anchor["mid"]) * 1.5
             + abs(ms[j].get("neutral_rb", 0.0) - anchor.get("neutral_rb", 0.0)) * 2.2
             + abs(ms[j]["rb"] - anchor["rb"]) * 0.45,
@@ -743,10 +839,13 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
             "regime": regime,
             "is_flashback": bool(ctx.get("is_flashback", False)),
             "scene_title": ctx.get("scene_title", ""),
+            "bg_label": ctx.get("bg_label", ""),
             "bg_desc": ctx.get("bg_desc", ""),
             "source_mode": source_mode,
             "start_seg": s_idx,
             "end_seg": e_idx - 1,
+            "start_idx": s_idx,
+            "end_idx": e_idx - 1,
             "seg_indices": seg_range,
             "anchor_seg": anchor_seg,
             "outlier_seg": outlier_seg,
@@ -764,12 +863,15 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
         if bg_up in ("AUTO", "BG_DEFAULT") or bg_up.startswith("SEEDANCE_HOOK"):
             continue
         base_loc = bg_up.split(":")[-1] if ":" in bg_up else bg_up
+        sc_t_low = (c.get("scene_title") or "").lower()
         tod = (
-            "NIGHT" if "NIGHT" in bg_up else (
+            "NIGHT" if ("NIGHT" in bg_up or any(k in sc_t_low for k in ("đêm", "tối", "khuya", "night"))) else (
                 "EVENING" if "EVENING" in bg_up else (
-                    "DUSK" if "DUSK" in bg_up else (
-                        "DAWN" if "DAWN" in bg_up else (
-                            "NOON" if "NOON" in bg_up else ("DAY" if "DAY" in bg_up else "")
+                    "DUSK" if ("DUSK" in bg_up or any(k in sc_t_low for k in ("hoàng hôn", "chiều", "dusk", "sunset"))) else (
+                        "DAWN" if ("DAWN" in bg_up or any(k in sc_t_low for k in ("rạng sáng", "bình minh", "dawn"))) else (
+                            "NOON" if ("NOON" in bg_up or "trưa" in sc_t_low) else (
+                                "DAY" if ("DAY" in bg_up or "sáng" in sc_t_low) else ""
+                            )
                         )
                     )
                 )
@@ -787,6 +889,228 @@ def cluster_timeline_scenes(seg_records: list, clip_bg_map: dict = None, bg_cont
             c["regime"] = best_reg
 
     return clusters
+
+
+def get_default_plan_path(proj_dir: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(proj_dir))
+    return f"/tmp/capcut_plan_{slug}.json"
+
+
+def get_default_scene_report_path(proj_dir: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(proj_dir))
+    return f"/tmp/{slug}_scene_report.txt"
+
+
+def generate_scene_report_and_starter_plan(
+    proj_dir: str,
+    project_model: str,
+    gt_path: str,
+    clusters: list,
+    seg_records: list,
+    preview_pages: list,
+) -> tuple[str, str]:
+    """
+    Writes two ready-to-read files so the AI Colorist NEVER needs to run ad-hoc `python3` commands
+    on `/tmp/capcut_metrics_<slug>.json`, `sf-board.json`, or `lut_optical_db.json`:
+      1. `/tmp/<Project>_scene_report.txt`: Complete human-and-LLM-readable report containing:
+         - Curated Clean 35mm LUT Reference Palette (from `lut_optical_db.json`)
+         - Every Scene Cluster (`scene_title`, `bg_desc`, `regime`, `Auto-LUT`, `Anchor` metrics)
+         - Every Child Segment (`Seg #0..#N-1` with `Mid`, `P5`, `P95`, `RB`, `NRB`, `SkRB`, `Sat`, and `[OUTLIER]` tags)
+      2. `/tmp/capcut_plan_<slug>.json`: Pre-populated Starter AI Grading Plan JSON for all scenes with
+         location-locked clean 35mm LUTs, `target_mid`, `preserve_warm_props`, and automatic biases for dark/tungsten scenes.
+    """
+    report_path = get_default_scene_report_path(proj_dir)
+    plan_path = get_default_plan_path(proj_dir)
+
+    # Choose clean, verified neutral 35mm LUTs by `(regime, base_loc_family)`
+    loc_lut_map = {}
+    day_pool = ("SKINTONE (10).cube", "FILM LOOK (15).cube", "FILM LOOK (5).cube", "HOLLYWOOD (1).cube")
+    warm_pool = ("SKINTONE (10).cube", "THE ROMANCE 09.cube", "HOLLYWOOD (2).cube")
+    gold_pool = ("THE ROMANCE 09.cube", "THE ROMANCE 04.cube")
+    night_lift_pool = ("THE ROMANCE 01.cube", "SKINTONE (9).cube", "THE ROMANCE 09.cube")
+    night_cool_tungsten_pool = ("SKINTONE (4).cube", "SKINTONE (9).cube")
+    cool_tech_pool = ("FILM LOOK (11).cube", "THE ROMANCE 07.cube")
+
+    plan_scenes = {}
+    plan_seg_overrides = {}
+    loc_idx_counter = 0
+
+    # Group clusters by `(regime, loc_family)` so returning to the same physical location uses the exact same LUT
+    family_groups = {}
+    for c in clusters:
+        bg_code = c.get("bg_code", "")
+        base_loc = bg_code.split(":")[-1] if ":" in bg_code else bg_code
+        loc_family = re.sub(r"[A-Z]$", "", base_loc.upper())
+        reg = c.get("regime", "DAY_CRISP")
+        family_groups.setdefault((reg, loc_family), []).append(c)
+
+    for (reg, loc_fam), g_clusters in family_groups.items():
+        weights = [max(1, len(x["seg_indices"])) for x in g_clusters]
+        avg_mid = float(np.average([x["anchor"]["mid"] for x in g_clusters], weights=weights))
+        avg_nrb = float(np.average([x["anchor"].get("neutral_rb", 0.0) for x in g_clusters], weights=weights))
+
+        if reg == "DAWN_DUSK_GOLD":
+            lut_choice = gold_pool[loc_idx_counter % len(gold_pool)]
+            lut_val = 0.21
+        elif reg == "NIGHT_WARM":
+            if avg_nrb > 0.080:
+                lut_choice = night_cool_tungsten_pool[0]
+                lut_val = 0.19
+            elif avg_mid < 0.250:
+                lut_choice = night_lift_pool[0]
+                lut_val = 0.19
+            else:
+                lut_choice = night_lift_pool[loc_idx_counter % len(night_lift_pool)]
+                lut_val = 0.19
+        elif reg in ("NIGHT_COOL", "COOL_TECH"):
+            lut_choice = cool_tech_pool[loc_idx_counter % len(cool_tech_pool)]
+            lut_val = 0.19
+        elif reg == "WARM_INT":
+            if avg_mid < 0.260:
+                lut_choice = "THE ROMANCE 01.cube"
+                lut_val = 0.19
+            else:
+                lut_choice = warm_pool[loc_idx_counter % len(warm_pool)]
+                lut_val = 0.20
+        else:
+            # DAY_CRISP
+            sc_titles = " ".join((x.get("scene_title") or "") for x in g_clusters).lower()
+            if any(k in sc_titles for k in ("phòng họp", "boardroom", "văn phòng", "office", "tower")):
+                lut_choice = "FILM LOOK (15).cube"
+                lut_val = 0.19
+            else:
+                lut_choice = day_pool[0]
+                lut_val = 0.20
+        loc_lut_map[(reg, loc_fam)] = (lut_choice, lut_val, round(avg_mid, 3))
+        loc_idx_counter += 1
+
+    for c in clusters:
+        cid = c["cluster_id"]
+        reg = c.get("regime", "DAY_CRISP")
+        bg_code = c.get("bg_code", "")
+        base_loc = bg_code.split(":")[-1] if ":" in bg_code else bg_code
+        loc_fam = re.sub(r"[A-Z]$", "", base_loc.upper())
+        lut_choice, lut_val, grp_mid = loc_lut_map.get((reg, loc_fam), ("SKINTONE (10).cube", 0.20, c["anchor"]["mid"]))
+
+        a = c["anchor"]
+        anc_mid = a["mid"]
+        anc_nrb = a.get("neutral_rb", 0.0)
+        anc_rb = a["rb"]
+
+        # Blend scene target_mid gently toward the location family average
+        raw_t_mid = 0.65 * anc_mid + 0.35 * grp_mid
+        if anc_mid < 0.160:
+            t_mid = round(max(0.205, anc_mid + 0.060), 3)
+        elif anc_mid < 0.240:
+            t_mid = round(max(0.235, anc_mid + 0.035), 3)
+        elif anc_mid > 0.455:
+            t_mid = round(min(0.435, anc_mid - 0.020), 3)
+        else:
+            t_mid = round(raw_t_mid, 3)
+
+        preserve_warm = bool(anc_nrb <= 0.080)
+        sc_entry = {
+            "regime": reg,
+            "lut": lut_choice,
+            "lut_val": lut_val,
+            "target_mid": t_mid,
+            "preserve_warm_props": preserve_warm,
+        }
+        if anc_mid < 0.160:
+            sc_entry["bright_bias"] = 0.035
+            sc_entry["shadow_bias"] = 0.045
+        elif anc_mid < 0.230:
+            sc_entry["bright_bias"] = 0.015
+            sc_entry["shadow_bias"] = 0.025
+
+        if not preserve_warm and anc_nrb > 0.080:
+            sc_entry["temp_bias"] = round(max(-0.055, -(anc_nrb - 0.045) * 0.60), 3)
+            sc_entry["sat_bias"] = -0.020
+            if lut_choice == "SKINTONE (4).cube" and anc_mid >= 0.30:
+                sc_entry["bright_bias"] = round(sc_entry.get("bright_bias", 0.0) + 0.020, 3)
+
+        sc_title = c.get("scene_title") or bg_code
+        sc_entry["note"] = f"{sc_title} ({bg_code})"
+        plan_scenes[str(cid)] = sc_entry
+        c["auto_plan"] = sc_entry
+
+    starter_plan = {
+        "global": {
+            "temp_bias": 0.0,
+            "bright_bias": 0.0,
+            "contrast_bias": 0.005,
+            "sat_bias": 0.0,
+            "lut_val_bias": 0.0,
+        },
+        "scenes": plan_scenes,
+        "segments": plan_seg_overrides,
+    }
+    try:
+        with open(plan_path, "w", encoding="utf-8") as pf:
+            json.dump(starter_plan, pf, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    lines = []
+    lines.append(f"=== CAPCUT AI COLORIST SCENE & SEGMENT REPORT: {os.path.basename(proj_dir)} ===")
+    lines.append(f"Model: {project_model.upper()} | Scenes: {len(clusters)} | Segments: {len(seg_records)} | Ground-Truth: {gt_path or 'Visual-Fallback'}")
+    lines.append(f"Starter AI Plan Pre-Generated: {plan_path} (use edit_file to refine specific scenes/segments!)")
+    lines.append(f"Visual Scene Strip Sheets: {', '.join(preview_pages)}")
+    lines.append("")
+    lines.append("=== CURATED CLEAN NEUTRAL 35MM LUT PALETTE (from lut_optical_db.json — DO NOT run python3 to query DB) ===")
+    lines.append("  * DAY_CRISP (Outdoor/Daylight) : SKINTONE (10).cube (mid=0.290, midRB=+0.008, sknRB=+0.295, satGain=1.08)")
+    lines.append("                                 | FILM LOOK (15).cube (mid=0.330, midRB=-0.012, sknRB=+0.347, satGain=1.22)")
+    lines.append("                                 | FILM LOOK (5).cube  (mid=0.281, midRB=-0.018, sknRB=+0.355, satGain=1.24)")
+    lines.append("                                 | HOLLYWOOD (1).cube  (mid=0.242, midRB=+0.009, sknRB=+0.320, satGain=1.19)")
+    lines.append("  * WARM_INT (Indoor Day/Warm)   : SKINTONE (10).cube (mid=0.290, midRB=+0.008) | THE ROMANCE 09.cube (mid=0.305, midRB=+0.013)")
+    lines.append("                                 | THE ROMANCE 01.cube (mid=0.449, midRB=+0.026, lifts dark interiors cleanly)")
+    lines.append("                                 | HOLLYWOOD (2).cube  (mid=0.322, midRB=+0.027, sknRB=+0.329, satGain=1.19)")
+    lines.append("  * DAWN_DUSK_GOLD (Golden Hour) : THE ROMANCE 09.cube (mid=0.305, midRB=+0.013, satGain=1.01)")
+    lines.append("                                 | THE ROMANCE 04.cube (mid=0.253, midRB=+0.027, satGain=1.11)")
+    lines.append("  * NIGHT_WARM (Night / Lantern) : THE ROMANCE 01.cube (mid=0.449, midRB=+0.026, ideal for lifting dark night/attic shots)")
+    lines.append("                                 | SKINTONE (4).cube   (mid=0.259, midRB=-0.004, satGain=0.89, ideal for cooling heavy orange tungsten NRB>0.08)")
+    lines.append("                                 | SKINTONE (9).cube   (mid=0.264, midRB=+0.001, satGain=0.88)")
+    lines.append("  * NIGHT_COOL / COOL_TECH       : FILM LOOK (11).cube (mid=0.277, midRB=-0.026) | THE ROMANCE 07.cube (mid=0.225, midRB=-0.019)")
+    lines.append("")
+    lines.append("=== COMPLETE SCENE CLUSTERS & PER-SEGMENT SCOPE METRICS ===")
+
+    for c in clusters:
+        a = c["anchor"]
+        ap = c.get("auto_plan", {})
+        sc_t = c.get("scene_title") or ""
+        bg_d = (c.get("bg_desc") or "").replace("\n", " ")[:130]
+        lines.append(
+            f"\n=== Scene[{c['cluster_id']:2d}] {c['bg_code']:12s} | {c.get('regime','AUTO'):14s} | "
+            f"AutoLUT: {ap.get('lut',''):20s} ({int(round(ap.get('lut_val',0.2)*100))}%) | "
+            f"segs {c['start_seg']}..{c['end_seg']} ({len(c['seg_indices'])} segs) | {sc_t} ==="
+        )
+        if bg_d:
+            lines.append(f"  BG: {bg_d}")
+        lines.append(
+            f"  Anchor: Mid={a['mid']:.3f} P5={a['p5']:.3f} P95={a['p95']:.3f} RB={a['rb']:+.3f} "
+            f"NRB={a.get('neutral_rb',0.0):+.3f} SkRB={a['skin_rb']:.3f} Sat={a['sat']:.3f} -> TargetMid={ap.get('target_mid', a['mid']):.3f}"
+        )
+        for s_idx in c["seg_indices"]:
+            sr = seg_records[s_idx]
+            sm = sr.get("metrics") or a
+            dm = sm.get("mid", a["mid"]) - a["mid"]
+            dnr = sm.get("neutral_rb", 0.0) - a.get("neutral_rb", 0.0)
+            flag = ""
+            if abs(dm) >= 0.045 or abs(dnr) >= 0.025:
+                flag = f"  <-- [OUTLIER dMid={dm:+.3f} dNRB={dnr:+.3f}]"
+            lines.append(
+                f"  Seg #{s_idx:3d} ({sr['material_name']:10s} @ {sr['start_sec']:5.1f}s+{sr['dur_sec']:4.1f}s): "
+                f"Mid={sm.get('mid',0):.3f} P5={sm.get('p5',0):.3f} P95={sm.get('p95',0):.3f} "
+                f"RB={sm.get('rb',0):+.3f} NRB={sm.get('neutral_rb',0):+.3f} SkRB={sm.get('skin_rb',0):.3f} Sat={sm.get('sat',0):.3f}{flag}"
+            )
+
+    try:
+        with open(report_path, "w", encoding="utf-8") as rf:
+            rf.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+    return report_path, plan_path
 
 
 def extract_rgb_frame(video_path: str, ts_sec: float, w: int = 216, h: int = 122) -> np.ndarray:
@@ -958,7 +1282,7 @@ def main():
         frames_list.append(frame_by_range.get(cache_key, np.zeros((122, 216, 3), dtype=np.uint8)))
         sc_obj = seg.get("clip", {}).get("scale", {}) if isinstance(seg.get("clip"), dict) else {}
         seg_scale = max(float(sc_obj.get("x", 1.0)), float(sc_obj.get("y", 1.0)))
-        seg_records.append({
+        rec = {
             "seg_idx": idx,
             "seg_id": seg.get("id", ""),
             "container": container_lbl,
@@ -969,7 +1293,12 @@ def main():
             "dur_sec": round(dur_sec, 2),
             "scale": round(seg_scale, 3),
             "metrics": m,
-        })
+        }
+        # Top-level metric aliases so s["mid"] and s["metrics"]["mid"] both work without KeyError
+        for mk in ("mid", "p5", "p25", "p50", "p75", "p95", "contrast", "rb", "neutral_rb", "gm", "sat", "skin_rb", "skin_sat"):
+            if mk in m:
+                rec[mk] = m[mk]
+        seg_records.append(rec)
 
     frames_arr = np.stack(frames_list, axis=0) if frames_list else np.zeros((0, 122, 216, 3), dtype=np.uint8)
     frames_cache_path = get_default_frames_cache_path(proj_dir)
@@ -986,25 +1315,34 @@ def main():
             print(f"  {k:10s}: median={np.median(arr):+.4f} | p10={np.percentile(arr, 10):+.3f} .. p90={np.percentile(arr, 90):+.3f}")
 
     clusters = cluster_timeline_scenes(seg_records, clip_bg_map, bg_context)
-    print(f"\n=== SCENE CLUSTERS ({len(clusters)} scenes, Mode={clusters[0]['source_mode'] if clusters else 'NONE'}) ===")
-    for c in clusters:
-        a = c["anchor"]
-        print(
-            f"  Scene[{c['cluster_id']:2d}] ({c['bg_code']:18s} | {c.get('regime','AUTO'):14s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
-            f"Anchor: Mid={a['mid']:.3f} RB={a['rb']:+.3f} NeutRB={a.get('neutral_rb',0.0):+.3f} SkinRB={a['skin_rb']:.3f} | "
-            f"MaxOutlier=#{c['outlier_seg']} (dMid={c['outlier_delta_mid']:+.3f} dNeutRB={c.get('outlier_delta_neutral_rb',0.0):+.3f} dRB={c['outlier_delta_rb']:+.3f})"
-        )
 
     preview_jpg = f"/tmp/{os.path.basename(proj_dir).replace(' ', '_')}_raw_scenes.jpg"
     preview_pages = [preview_jpg]
     try:
         preview_pages = render_raw_scene_contact_sheet(all_seg_tuples, seg_records, clusters, preview_jpg, proj_dir, frames_arr=frames_arr)
-        print(f"\n[MANDATORY AI COLORIST STEP 1] Rendered Multi-Shot Scene Strip sheet: {preview_jpg}")
-        if len(preview_pages) > 1:
-            print(f"-> High-Res Paginated Scene Sheets ({len(preview_pages)} pages): {', '.join(preview_pages)}")
-        print("-> AI Colorist MUST call read_file on the Scene Strip sheets to inspect all 3 shots (First | Anchor | Outlier) per scene before grading!")
     except Exception as exc:
         print(f"Note: Could not render raw scene preview sheet ({exc})")
+
+    report_path, plan_path = generate_scene_report_and_starter_plan(
+        proj_dir, project_model, gt_path, clusters, seg_records, preview_pages
+    )
+
+    print(f"\n=== SCENE CLUSTERS ({len(clusters)} scenes, Mode={clusters[0]['source_mode'] if clusters else 'NONE'}) ===")
+    for c in clusters:
+        a = c["anchor"]
+        sc_t = (c.get("scene_title") or "")[:52]
+        print(
+            f"  Scene[{c['cluster_id']:2d}] ({c['bg_code']:12s} | {c.get('regime','AUTO'):14s}) Segs {c['start_seg']:3d}..{c['end_seg']:3d} ({len(c['seg_indices']):2d} segs) | "
+            f"Anchor: Mid={a['mid']:.3f} RB={a['rb']:+.3f} NeutRB={a.get('neutral_rb',0.0):+.3f} SkinRB={a['skin_rb']:.3f} | "
+            f"MaxOutlier=#{c['outlier_seg']:3d} (dMid={c['outlier_delta_mid']:+.3f} dNRB={c.get('outlier_delta_neutral_rb',0.0):+.3f}) | {sc_t}"
+        )
+
+    print(f"\n[MANDATORY AI COLORIST STEP 1] Rendered Multi-Shot Scene Strip sheet: {preview_jpg}")
+    if len(preview_pages) > 1:
+        print(f"-> High-Res Paginated Scene Sheets ({len(preview_pages)} pages): {', '.join(preview_pages)}")
+    print(f"-> Full Scene & Per-Segment Scope Report (with Clean 35mm LUT Table): {report_path}")
+    print(f"-> Pre-Populated Starter AI Grading Plan JSON: {plan_path}")
+    print("-> AI Colorist MUST call read_file on the Scene Strip sheets AND the Scene Report (NEVER run python3 one-liners!)")
 
     payload = {
         "project_model": project_model,
@@ -1012,9 +1350,13 @@ def main():
         "ground_truth_source": gt_path,
         "raw_preview_sheet": preview_jpg,
         "raw_preview_pages": preview_pages,
+        "scene_report_path": report_path,
+        "starter_plan_path": plan_path,
         "clip_bg_map": {str(k): v for k, v in clip_bg_map.items()},
         "bg_context": bg_context,
         "clusters": clusters,
+        "scenes": clusters,
+        "scene_clusters": clusters,
         "segments": seg_records,
     }
     default_cache = get_default_metrics_cache_path(proj_dir)

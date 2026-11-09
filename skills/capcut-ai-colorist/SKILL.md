@@ -15,10 +15,11 @@ You are a **Senior DI (Digital Intermediate) Film Colorist** grading AI-generate
   - Never stop to ask the user questions (no intake prompts, no confirmation pauses). Execute the entire 5-step visual grading workflow from start to finish in one go and deliver the final best graded project directly.
   - **Target Time Budget (`10–20 Minutes`, Strictly `<= 20 Minutes`)**:
     - Spend your time budget on **real, thorough visual colorist work**: reading the screenplay context (`KICHBAN` / `BANGTRA` / `PROMPT_ANH_REF` / `sf-board.json`), calling `read_file` on **every high-resolution paginated Scene Strip page** (`/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`...) so no scene or shot is downscaled/blurry, designing a thoughtful scene & outlier-shot plan (`/tmp/capcut_plan_<slug>.json`), and visually inspecting **every paginated Before/After QA page** (`/tmp/<Project>_graded_comparison_p1.jpg`, `_p2.jpg`...) with a refinement pass if any scene or cut needs tuning.
-  - **Strict Continuity & Efficiency Guardrails (Avoid Wasting Time on Bugs)**:
-    1. **100% Scene-Locked LUT (`Stage 1`) + Closed-Loop Pixel-Level Primary Convergence (`Stage 2`)**: Every segment inside a Scene Cluster uses the **exact same Primary 35mm `.cube` LUT** (`scene_cfg["lut"]`, with micro-adaptive intensity `±2.5%` when a LUT amplifies a clip's raw defect), while `Stage 2` (12 Adjust sliders) actively converges adjacent clips that have different raw colors/exposure using **3-Point Temporal Boundary Matching (`20% Entry / 50% Center / 80% Exit`)**, a **Blended Reference (`65%` Sub-Space Anchor + `35%` Immediate Same-Space Neighbor)**, a **Multi-Cue Illumination & Skin Probe (`d_nrb + d_skin_rb + d_shd_rb`)**, and a **Closed-Loop Pixel-Level Verification Pass (`refine_grades_closed_loop_on_frames`)** that simulates the actual 3D `.cube` LUT + Adjust sliders on every frame and trims any residual post-LUT discrepancy.
-    2. **Automatic 2-Space Intercut Partitioning (`partition_intra_scene_subspaces` + Short-Intercut Location Lock)**: When a scene cuts back and forth between 2 distinct spaces (`A1 -> B1 -> A2 -> B2`, either across separate `BG` clusters or inside a single bimodal `BG` cluster where both modes have `>= 2` shots), `apply_grade.py` automatically locks all `A` shots to `Anchor_A` (and `A` neighbors) and all `B` shots to `Anchor_B` (and `B` neighbors), while pulling isolated 1-shot AI glitches (`count == 1`) strongly back into the main space.
-    3. **Clean `--plan` JSON Authoring**: Write `/tmp/capcut_plan_<slug>.json` directly using `write_file` (keying `scenes` by `cluster_id` or `base_location` like `"LANE_DAY"`, `"ENTRY_EVENING"`, `"ROW_FINAL_NIGHT"`, and `segments` only for genuine lighting/exposure outliers). Never waste time on broken `python3 -c` escaping or overriding normal camera cuts that only differ in background/costume color!
+  - **Strict Continuity & Efficiency Guardrails (Zero Failed Commands & Fast Token Streaming)**:
+    1. **100% Scene-Locked LUT (`Stage 1`) + Closed-Loop Pixel-Level Primary Convergence (`Stage 2`)**: Every segment inside a Scene Cluster uses the **exact same Primary 35mm `.cube` LUT** (`scene_cfg["lut"]`, with micro-adaptive intensity `±2.5%` when a LUT amplifies a clip's raw defect), while `Stage 2` (12 Adjust sliders) actively converges adjacent clips that have different raw colors/exposure using **3-Point Temporal Boundary Matching (`20% Entry / 50% Center / 80% Exit`)**, **Optical LUT Midtone Shift Compensation (`lut_mid_err`)**, a **Blended Reference (`65%` Sub-Space Anchor + `35%` Immediate Same-Space Neighbor)**, a **Multi-Cue Illumination & Skin Probe (`d_nrb + d_skin_rb + d_shd_rb`)**, and a **Closed-Loop Pixel-Level Verification Pass (`refine_grades_closed_loop_on_frames`)** that simulates the actual 3D `.cube` LUT + Adjust sliders on every frame and trims any residual post-LUT discrepancy while preserving explicit AI `bright_offset` / `temp_offset` overrides.
+    2. **3-Axis Sub-Space Partitioning & Cross-Space Cutaway Isolation (`partition_intra_scene_subspaces` + Short-Intercut Location Lock)**: When a scene cuts between 2 distinct spaces (`A1 -> B1 -> A2 -> B2`), `apply_grade.py` checks both bimodal cluster splits (`>= 2` shots per mode with tight internal cohesion `std <= 0.048` for exposure or `std <= 0.025` for color so edge shots of the main room are never misgrouped with an outlier) AND **Cross-Space Cutaway Isolation (Axis 3)** for parallel/transition scenes (`↔`, `→`, `song song`, or multi-axis room jumps like a dark attic cutaway inside a bright kitchen scene), grading the cutaway independently instead of crushing or washing it out.
+    3. **STRICT ZERO-PYTHON-PROBING RULE (Never Run `python3 -c` on Cache Files)**: `analyze_project.py` automatically writes **`/tmp/<Project>_scene_report.txt`** (containing the **Curated Clean Neutral 35mm LUT Palette** + **Complete Scene Clusters & Per-Segment Scope Metrics** for every segment `Seg #0..#N-1`) AND pre-generates **`/tmp/capcut_plan_<slug>.json`** (the Starter AI Grading Plan JSON for all scenes). **NEVER** run `python3 -c`, heredocs, or shell scripts to inspect `/tmp/capcut_metrics_<slug>.json`, `lut_optical_db.json`, or `sf-board.json` — simply call `read_file` on `/tmp/<Project>_scene_report.txt` and `/tmp/capcut_plan_<slug>.json`!
+    4. **Use `edit_file` on the Pre-Generated Starter Plan (`/tmp/capcut_plan_<slug>.json`)**: Instead of streaming 250 lines of boilerplate JSON from scratch with `write_file` (which wastes `~6,000+` output tokens and risks API stream timeouts), inspect the pre-generated `/tmp/capcut_plan_<slug>.json` with `read_file` and use **`edit_file`** to make targeted visual adjustments to specific scenes or genuine outlier segments (`~200–500` tokens in `~2s`).
 
 ---
 
@@ -60,21 +61,26 @@ Execute all 5 steps directly without asking the user any questions:
 python3 "/Users/daho100/Documents/SF Board/.agents/skills/capcut-draft-tech/scripts/analyze_project.py" "<PROJECT_NAME_OR_ID>"
 ```
 - Auto-detects `SEEDANCE` / `GROK` / `OMNI` / `HYBRID` from source video durations.
-- Maps clips to ground-truth scenes (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `sf-board.json`), caches 17-metric segment scopes to `/tmp/capcut_metrics_<slug>.json`, and renders the **3-Shot Scene Strip Contact Sheet** at `/tmp/<Project>_raw_scenes.jpg`.
+- Maps clips to ground-truth scenes (`*BANGTRA*.txt`, `*PROMPT_ANH_REF*.txt`, `sf-board.json`), preserving distinct time-of-day/lighting variants (`IMG1A` morning vs `IMG1B` gray dawn vs `IMG1C` noon) while merging pure reverse camera angles (`"góc"`).
+- Automatically generates 3 ready-to-read artifacts in a single run:
+  1. **High-Res 3-Shot Scene Strip Contact Sheets**: `/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`... (plus `/tmp/<Project>_raw_scenes.jpg`).
+  2. **Human-Readable Scene & Segment Scope Report + Curated Clean 35mm LUT Table**: `/tmp/<Project>_scene_report.txt`.
+  3. **Pre-Generated Starter AI Grading Plan JSON**: `/tmp/capcut_plan_<slug>.json` (pre-populated with all scenes, location-locked clean 35mm LUTs, `target_mid`, `preserve_warm_props`, and automatic biases).
 
-### Step 2: Visually Inspect All High-Res Paginated Scene Strips (`read_file`) & Screenplay Context
-- Call `read_file` on `/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`... (or `/tmp/<Project>_raw_scenes.jpg` for short projects `<= 16` scenes) so you inspect every Scene Cluster's 3 representative shots at full, un-downscaled resolution:
-  - **`1.First`** (opening shot of the scene),
-  - **`2.Anchor`** (median reference shot of the scene),
-  - **`3.Outlier`** (the shot in the scene with the largest exposure/white-balance jump `dMid` / `dNRB` from the anchor).
-- Visually check each scene for:
-  1. **True time-of-day & lighting mood** (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`) — verify whether keyword classification matched the actual visual scene (for example, an indoor VIP lounge or warm wooden courtroom vs. a cold server room).
-  2. **Colorful props/costumes/backgrounds** (pink hats, red brick, warm wood, BBQ smoke, foliage) vs. true skin/ambient casts (`NeutRB`).
-  3. **Cross-scene continuity** (which scenes return to the same room/arena/courthouse and must share the same Primary 35mm LUT family and target exposure/warmth).
-  4. **Intra-scene outlier cuts** (`3.Outlier`) that jump brighter/darker or warmer/cooler than `2.Anchor`.
+### Step 2: Visually Inspect All High-Res Scene Strips, `/tmp/<Project>_scene_report.txt` & Starter Plan (`read_file` in Parallel — ZERO `python3` Probing)
+- In a **single parallel `read_file` batch**, read:
+  - `/tmp/<Project>_raw_scenes_p1.jpg`, `_p2.jpg`... (every paginated Scene Strip page at full resolution),
+  - `/tmp/<Project>_scene_report.txt` (complete per-segment metrics `Mid`, `P5`, `P95`, `RB`, `NRB`, `SkRB`, `Sat`, `[OUTLIER]` flags, and the Curated Clean 35mm LUT table),
+  - `/tmp/capcut_plan_<slug>.json` (the pre-generated Starter Plan JSON).
+- **STRICT PROHIBITION**: Do **NOT** run `python3 -c` or heredocs to query `/tmp/capcut_metrics_<slug>.json`, `lut_optical_db.json`, or `sf-board.json`. Everything is already formatted in `/tmp/<Project>_scene_report.txt`!
+- Visually check each scene's `1.First | 2.Anchor | 3.Outlier` strip against the screenplay context for:
+  1. **True time-of-day & lighting mood** (`DAWN_DUSK_GOLD`, `DAY_CRISP`, `WARM_INT`, `NIGHT_WARM`, `NIGHT_COOL`, `COOL_TECH`) — verify that the pre-generated starter plan's `regime` and `lut` match the visual frames.
+  2. **Colorful props/costumes/backgrounds** (pink hats, red brick, warm wood, BBQ smoke, foliage) vs. true skin/ambient casts (`NRB`).
+  3. **Cross-scene continuity** (recurring locations like `IMG1*`, `IMG6*`, `IMG7*` sharing a cohesive 35mm LUT family and appropriate time-of-day exposure/warmth).
+  4. **Intra-scene outlier cuts or cross-space cutaways** (`3.Outlier` or `[OUTLIER]` segments in `/tmp/<Project>_scene_report.txt`) that need a targeted per-segment `bright_offset` or `temp_offset`.
 
-### Step 3: Write the AI Colorist Grading Plan (`/tmp/capcut_plan_<slug>.json`)
-Create `/tmp/capcut_plan_<slug>.json` capturing your visual direction for the film and each scene:
+### Step 3: Refine the Pre-Generated Starter Plan (`/tmp/capcut_plan_<slug>.json`) Using `edit_file`
+- Use **`edit_file`** (not `write_file` from scratch) on `/tmp/capcut_plan_<slug>.json` to apply your visual colorist refinements to specific scenes and genuine outlier segments:
 ```json
 {
   "global": {
@@ -86,7 +92,9 @@ Create `/tmp/capcut_plan_<slug>.json` capturing your visual direction for the fi
   "scenes": {
     "0": {
       "regime": "DAWN_DUSK_GOLD",
-      "preferred_families": ["THE ROMANCE", "SKINTONE", "MOOD"],
+      "lut": "THE ROMANCE (8).cube",
+      "lut_val": 0.20,
+      "target_mid": 0.34,
       "preserve_warm_props": true,
       "note": "Golden morning ranch paddock - warm natural sunlight & clean skin"
     },
@@ -99,9 +107,10 @@ Create `/tmp/capcut_plan_<slug>.json` capturing your visual direction for the fi
     }
   },
   "segments": {
-    "59": {
-      "force_anchor_match": true,
-      "temp_offset": -0.01
+    "84": {
+      "bright_offset": 0.05,
+      "temp_offset": -0.015,
+      "note": "Dark attic cutaway inside S15 - gentle shadow lift while keeping attic mood"
     }
   }
 }
