@@ -1421,11 +1421,31 @@ def apply_3d_lut_and_adjust_to_rgb(rgb: np.ndarray, lut_path: str, lut_val: floa
 
 
 def _measure_rgb_mid_rb(rgb: np.ndarray) -> tuple[float, float, float]:
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    H, W = rgb.shape[:2]
+    r_full, g_full, b_full = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    luma_full = 0.2126 * r_full + 0.7152 * g_full + 0.0722 * b_full
+    max_y_bar = int(H * 0.18)
+    max_x_bar = int(W * 0.18)
+    row_p95 = np.percentile(luma_full, 95, axis=1)
+    col_p95 = np.percentile(luma_full, 95, axis=0)
+    y0 = 0
+    while y0 < max_y_bar and row_p95[y0] <= 0.025:
+        y0 += 1
+    y1 = H
+    while (H - y1) < max_y_bar and y1 > y0 + 32 and row_p95[y1 - 1] <= 0.025:
+        y1 -= 1
+    x0 = 0
+    while x0 < max_x_bar and col_p95[x0] <= 0.025:
+        x0 += 1
+    x1 = W
+    while (W - x1) < max_x_bar and x1 > x0 + 32 and col_p95[x1 - 1] <= 0.025:
+        x1 -= 1
+    act = rgb[y0:y1, x0:x1]
+    r, g, b = act[..., 0], act[..., 1], act[..., 2]
+    luma = luma_full[y0:y1, x0:x1]
     rb_map = r - b
     rb = float(np.mean(rb_map))
-    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+    chroma = np.max(act, axis=2) - np.min(act, axis=2)
     valid = (luma >= 0.06) & (luma <= 0.90)
     th = max(0.065, float(np.percentile(chroma[valid], 30)) if np.any(valid) else 0.08)
     nmask = valid & (chroma <= th)

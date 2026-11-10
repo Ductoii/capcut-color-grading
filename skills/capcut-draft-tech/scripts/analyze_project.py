@@ -151,8 +151,33 @@ def detect_source_models(all_seg_tuples: list, proj_dir: str) -> tuple[str, dict
 
 
 def _measure_single_frame(arr: np.ndarray) -> dict:
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    H, W = arr.shape[:2]
+    r_full, g_full, b_full = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    luma_full = 0.2126 * r_full + 0.7152 * g_full + 0.0722 * b_full
+
+    # Active-image content crop: strip baked-in letterbox (top/bottom) or pillarbox (left/right) black bars
+    # up to 18% margin where row/col 95th-percentile luma <= 0.025 so black bars never drag down p5/mid.
+    max_y_bar = int(H * 0.18)
+    max_x_bar = int(W * 0.18)
+    row_p95 = np.percentile(luma_full, 95, axis=1)
+    col_p95 = np.percentile(luma_full, 95, axis=0)
+    y0 = 0
+    while y0 < max_y_bar and row_p95[y0] <= 0.025:
+        y0 += 1
+    y1 = H
+    while (H - y1) < max_y_bar and y1 > y0 + 32 and row_p95[y1 - 1] <= 0.025:
+        y1 -= 1
+    x0 = 0
+    while x0 < max_x_bar and col_p95[x0] <= 0.025:
+        x0 += 1
+    x1 = W
+    while (W - x1) < max_x_bar and x1 > x0 + 32 and col_p95[x1 - 1] <= 0.025:
+        x1 -= 1
+
+    act = arr[y0:y1, x0:x1]
+    r, g, b = act[:, :, 0], act[:, :, 1], act[:, :, 2]
+    luma = luma_full[y0:y1, x0:x1]
+
     p1, p5, p25, p50, p75, p95, p99 = np.percentile(luma, [1, 5, 25, 50, 75, 95, 99])
     mid = float(np.mean(luma))
     contrast = float(p95 - p5)
@@ -167,12 +192,13 @@ def _measure_single_frame(arr: np.ndarray) -> dict:
     mid_rb = float(np.mean(rb_map[mid_mask])) if np.any(mid_mask) else rb
     hi_rb = float(np.mean(rb_map[hi_mask])) if np.any(hi_mask) else rb
     gm = float(np.mean(gm_map))
-    cmax = np.max(arr, axis=2)
-    cmin = np.min(arr, axis=2)
+    cmax = np.max(act, axis=2)
+    cmin = np.min(act, axis=2)
     chroma = cmax - cmin
     sat = float(np.mean(chroma))
     hsv_s_map = chroma / np.maximum(cmax, 1e-4)
     hsv_s = float(np.mean(hsv_s_map))
+    hsv_s_full = (np.max(arr, axis=2) - np.min(arr, axis=2)) / np.maximum(np.max(arr, axis=2), 1e-4)
 
     # Achromatic / near-neutral pixel white-balance probe (separates true ambient lighting cast from colorful props/hats/walls)
     valid_luma = (luma >= 0.06) & (luma <= 0.90)
@@ -186,9 +212,9 @@ def _measure_single_frame(arr: np.ndarray) -> dict:
         neutral_gm = gm
 
     # Central-frame human skin locus (excludes top sky / bottom floor and pure yellow/wood surfaces)
-    rc, gc, bc = r[14:106, 22:194], g[14:106, 22:194], b[14:106, 22:194]
-    lc = luma[14:106, 22:194]
-    sc_hsv = hsv_s_map[14:106, 22:194]
+    rc, gc, bc = r_full[14:106, 22:194], g_full[14:106, 22:194], b_full[14:106, 22:194]
+    lc = luma_full[14:106, 22:194]
+    sc_hsv = hsv_s_full[14:106, 22:194]
     rb_c = rc - bc
     gb_ratio = (gc - bc) / np.maximum(rb_c, 1e-4)
     skin_mask = (rc > gc) & (gc > bc) & (rb_c > 0.060) & (gb_ratio >= 0.20) & (gb_ratio <= 0.68) & (lc > 0.16) & (lc < 0.88)
